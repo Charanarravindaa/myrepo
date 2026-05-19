@@ -41,6 +41,16 @@ from .ppm import (
     encode_ppm_seq,
     encode_ppm_stream,
 )
+from .classify import (
+    ARITH as _CAT_ARITH,
+    CODE as _CAT_CODE,
+    ENGLISH as _CAT_ENGLISH,
+    LOGS as _CAT_LOGS,
+    RANDOM as _CAT_RANDOM,
+    REDUNDANT as _CAT_REDUNDANT,
+    UNKNOWN as _CAT_UNKNOWN,
+    classify as _classify,
+)
 from .random_access import (
     BLOCK_SIZE_DEFAULT,
     RandomReader,
@@ -755,6 +765,209 @@ vector_rle_random = Pipeline(
 )
 
 
+# ---------------------------------------------------------------------------
+# Pipeline M: vector_auto — general-purpose dispatch (v9)
+# ---------------------------------------------------------------------------
+# One entry point. Classifies the input via vrle.classify.classify and
+# picks the best underlying pipeline + shared dictionary. A 1-byte
+# routing tag stored in the header tells the decoder which sub-pipeline
+# was used so it can dispatch correctly.
+#
+# Routing tags:
+#   0 = byte-level PPM (ppm_rc)
+#   1 = word-level vector_rle (no shared dict)
+#   2 = vector_rle_shared with the English dict
+#   3 = vector_rle_shared with the logs dict
+#   4 = vector_rle_shared with the code dict
+
+
+_TAG_PPM_BYTE = 0
+_TAG_VRLE_NODICT = 1
+_TAG_VRLE_ENGLISH = 2
+_TAG_VRLE_LOGS = 3
+_TAG_VRLE_CODE = 4
+_TAG_ARITH = 5
+_TAG_STORE_RAW = 6  # incompressible data — store as-is
+
+_DICT_NAMES_BY_TAG = {
+    _TAG_VRLE_ENGLISH: "english",
+    _TAG_VRLE_LOGS: "logs",
+    _TAG_VRLE_CODE: "code",
+}
+
+_NAMED_DICT_CACHE: dict = {}
+
+
+def _load_named_dict(name: str) -> SharedDict:
+    if name not in _NAMED_DICT_CACHE:
+        path = Path(__file__).resolve().parent / "dicts" / f"{name}.dict"
+        _NAMED_DICT_CACHE[name] = SharedDict.load(path)
+    return _NAMED_DICT_CACHE[name]
+
+
+def _category_to_tag(category: str) -> int:
+    if category == _CAT_ENGLISH:
+        return _TAG_VRLE_ENGLISH
+    if category == _CAT_LOGS:
+        return _TAG_VRLE_LOGS
+    if category == _CAT_CODE:
+        return _TAG_VRLE_CODE
+    if category == _CAT_ARITH:
+        return _TAG_ARITH
+    if category == _CAT_RANDOM:
+        return _TAG_STORE_RAW
+    # redundant / unknown: byte-level PPM is the safe default.
+    return _TAG_PPM_BYTE
+
+
+def _compress_with_dict_tag(data: bytes, tag: int) -> bytes:
+    """Body encoder for a dict-flavoured vector_rle_shared.
+
+    Same wire-format as ``_compress_vector_rle_shared`` but the dict is
+    chosen by ``tag``. The 1-byte ``tag`` itself is *not* written here
+    — it is written by ``_compress_vector_auto``.
+    """
+    if tag == _TAG_VRLE_NODICT:
+        return _compress_vector_rle(data)
+    base = _load_named_dict(_DICT_NAMES_BY_TAG[tag])
+
+    out = bytearray()
+    out += leb128_encode(len(data))
+    if not data:
+        return bytes(out)
+
+    n_base = len(base)
+    tokens = tokenize(data)
+
+    seen_local: set = set()
+    novel_tokens: list = []
+    for t in tokens:
+        if base.get_id(t) is None and t not in seen_local:
+            seen_local.add(t)
+            novel_tokens.append(t)
+    novel_tokens.sort()
+    n_local = len(novel_tokens)
+    local_id_of = {t: n_base + i for i, t in enumerate(novel_tokens)}
+
+    out += leb128_encode(base.version)
+    out += leb128_encode(n_local)
+    out += leb128_encode(len(tokens))
+
+    if n_local > 0:
+        out += encode_ppm_stream(bytes(len(t) for t in novel_tokens), order=2)
+        out += encode_ppm_stream(b"".join(novel_tokens), order=4)
+
+    alphabet = n_base + n_local
+    if alphabet > 1:
+        ids = [
+            base.get_id(t) if base.get_id(t) is not None else local_id_of[t]
+            for t in tokens
+        ]
+        order = _vector_rle_ppm_order(len(ids))
+        out += encode_ppm_seq(ids, alphabet_size=alphabet, order=order)
+    return bytes(out)
+
+
+def _decompress_with_dict_tag(blob: bytes, tag: int) -> bytes:
+    if tag == _TAG_VRLE_NODICT:
+        return _decompress_vector_rle(blob)
+    base = _load_named_dict(_DICT_NAMES_BY_TAG[tag])
+
+    pos = 0
+    input_len, pos = leb128_decode(blob, pos)
+    if input_len == 0:
+        return b""
+    version, pos = leb128_decode(blob, pos)
+    if version != base.version:
+        raise ValueError(
+            f"shared dict version mismatch: file v{version}, runtime v{base.version}"
+        )
+    n_local, pos = leb128_decode(blob, pos)
+    total, pos = leb128_decode(blob, pos)
+
+    n_base = len(base)
+    novel: list = []
+    if n_local > 0:
+        lengths_bytes, pos = decode_ppm_stream(blob, pos)
+        bytes_blob, pos = decode_ppm_stream(blob, pos)
+        cursor = 0
+        for L in lengths_bytes:
+            novel.append(bytes_blob[cursor : cursor + L])
+            cursor += L
+
+    alphabet = n_base + n_local
+    if alphabet <= 1:
+        if total == 0:
+            return b""
+        tok = base.get_token(0) if n_local == 0 else novel[0]
+        return tok * total
+
+    ids, _ = decode_ppm_seq(blob, pos)
+    seq = [base.get_token(i) if i < n_base else novel[i - n_base] for i in ids]
+    return detokenize(seq)
+
+
+def _dict_covers(data: bytes, dict_name: str, threshold: float = 0.75) -> bool:
+    """Return True if at least `threshold` of the tokens in a 2 KB probe
+    of `data` are present in the named shared dict."""
+    d = _load_named_dict(dict_name)
+    sample = data[:2048]
+    toks = tokenize(sample)
+    if not toks:
+        return False
+    hits = sum(1 for t in toks if t in d)
+    return (hits / len(toks)) >= threshold
+
+
+def _compress_vector_auto(data: bytes) -> bytes:
+    if not data:
+        return bytes([_TAG_PPM_BYTE]) + leb128_encode(0)
+    category = _classify(data)
+    tag = _category_to_tag(category)
+
+    # Dict-based tags get a coverage sanity check. If the chosen dict
+    # doesn't actually match the data, fall back to arith_rc (the
+    # right call for text-y inputs with no dict-matching word structure).
+    if tag in _DICT_NAMES_BY_TAG:
+        if not _dict_covers(data, _DICT_NAMES_BY_TAG[tag]):
+            tag = _TAG_ARITH
+
+    if tag == _TAG_PPM_BYTE:
+        body = encode_ppm_stream(data, order=4)
+    elif tag == _TAG_ARITH:
+        body = _compress_arith_rc(data)
+    elif tag == _TAG_STORE_RAW:
+        body = leb128_encode(len(data)) + data
+    else:
+        body = _compress_with_dict_tag(data, tag)
+    return bytes([tag]) + body
+
+
+def _decompress_vector_auto(blob: bytes) -> bytes:
+    if not blob:
+        return b""
+    tag = blob[0]
+    body = blob[1:]
+    if tag == _TAG_PPM_BYTE:
+        out, _ = decode_ppm_stream(body)
+        return out
+    if tag == _TAG_ARITH:
+        return _decompress_arith_rc(body)
+    if tag == _TAG_STORE_RAW:
+        n, pos = leb128_decode(body, 0)
+        return body[pos : pos + n]
+    if tag == _TAG_VRLE_NODICT or tag in _DICT_NAMES_BY_TAG:
+        return _decompress_with_dict_tag(body, tag)
+    raise ValueError(f"unknown vector_auto routing tag {tag}")
+
+
+vector_auto = Pipeline(
+    "vector_auto",
+    _compress_vector_auto,
+    _decompress_vector_auto,
+)
+
+
 ALL_PIPELINES = [
     rle_rc,
     mtf_rle_rc,
@@ -768,4 +981,5 @@ ALL_PIPELINES = [
     vector_rle,
     vector_rle_shared,
     vector_rle_random,
+    vector_auto,
 ]
