@@ -4,6 +4,7 @@ from .mathvec import MathRLE
 from .pipelines import (
     ALL_PIPELINES,
     Pipeline,
+    arith_rc,
     bwt_mtf_rle_rc,
     bwt_ppm_rc,
     deflate_rc,
@@ -29,6 +30,7 @@ __all__ = [
     "lz_rc",
     "lz_bwt_mtf_rle_rc",
     "deflate_rc",
+    "arith_rc",
     "ppm_rc",
     "bwt_ppm_rc",
     "ALL_PIPELINES",

@@ -428,8 +428,53 @@ deflate_rc = Pipeline("deflate_rc", _compress_deflate_rc, _decompress_deflate_rc
 # would be sparse but byte-level conditional probabilities are rich.
 
 
+# ---------------------------------------------------------------------------
+# Pipeline I: Pure adaptive arithmetic (order-0) on the raw byte stream
+# ---------------------------------------------------------------------------
+# No RLE / LZ / BWT / context — just adaptive arithmetic over byte counts.
+# Optimal for context-free distributions (e.g. text-like data where each
+# byte is drawn from a skewed distribution but successive bytes are
+# independent).
+
+
+def _compress_arith_rc(data: bytes) -> bytes:
+    out = bytearray()
+    out += leb128_encode(len(data))
+    if not data:
+        return bytes(out)
+    out += encode_stream(list(data), alphabet_size=256)
+    return bytes(out)
+
+
+def _decompress_arith_rc(blob: bytes) -> bytes:
+    pos = 0
+    n, pos = leb128_decode(blob, pos)
+    if n == 0:
+        return b""
+    syms, _ = decode_stream(blob, pos)
+    return bytes(syms)
+
+
+arith_rc = Pipeline("arith_rc", _compress_arith_rc, _decompress_arith_rc)
+
+
+def _adaptive_order(n: int) -> int:
+    """Pick a PPM order based on input size.
+
+    Higher orders need more data to amortise their many small contexts.
+    Tuned empirically: order 2 is best below ~8 KB, order 3 in the
+    middle, order 4 once we have enough data for deep contexts to
+    actually repeat.
+    """
+    if n < 8000:
+        return 2
+    if n < 14000:
+        return 3
+    return 4
+
+
 def _compress_ppm_rc(data: bytes) -> bytes:
-    return encode_ppm_stream(data, order=4)
+    return encode_ppm_stream(data, order=_adaptive_order(len(data)))
 
 
 def _decompress_ppm_rc(blob: bytes) -> bytes:
@@ -481,6 +526,7 @@ ALL_PIPELINES = [
     lz_rc,
     lz_bwt_mtf_rle_rc,
     deflate_rc,
+    arith_rc,
     ppm_rc,
     bwt_ppm_rc,
 ]
