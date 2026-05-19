@@ -277,6 +277,34 @@ pipeline within 1–10 × of zstd throughput on text. That's the
 *real* C/Rust port — multi-week work, but the architecture is
 validated by the 15 × Cython result.
 
+### Roadmap to OS-native deployment
+
+The Python prototype is the algorithmic reference. The next milestone
+is a C/Rust port that runs at production throughput.
+
+The format, streaming protocol, error semantics, memory bounds, and
+C ABI are specified in **[`docs/format-v1.md`](docs/format-v1.md)**.
+Read that before starting the port.
+
+Headline points:
+
+| Layer | Status |
+|---|---|
+| Algorithmic core (PPM, word-tok, shared dicts, classifier, dispatch) | ✅ done in Python |
+| Random-access blocks + reader | ✅ done in Python |
+| Cython hot-path acceleration | ✅ 14.9× speedup on byte-level PPM |
+| Per-block CRC32C | 🚧 spec'd; not yet in Python prototype |
+| Streaming API (`feed` / `finish`) | 🚧 spec'd; not yet in Python prototype |
+| `dict_id` = SHA-256/128 (content-addressed) | 🚧 spec'd; `SharedDict` still uses integer version |
+| C/Rust port with sparse contexts | 🚧 ~10 weeks of work; design in `docs/format-v1.md` |
+| `lzbench` submission | 🚧 blocked on C/Rust port |
+| FUSE filesystem (`vrlefs`) | 🚧 blocked on C/Rust port |
+| Distro-shipped dictionaries (apt/rpm) | 🚧 packaging work, post-port |
+
+The "OS-native compression" pitch needs every row above to be ✅. The
+algorithm work is done at v9; what remains is the operational layer
+plus the throughput port.
+
 ### Standard-corpus benchmark (held-out NLTK Gutenberg + Brown)
 
 The numbers above come from custom small datasets. To validate against
