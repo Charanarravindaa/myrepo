@@ -1,7 +1,14 @@
 from .core import Run, encode_runs, decode_runs, iter_runs
 from .sequence import SequenceRLE
 from .mathvec import MathRLE
-from . import bitpack
+from .pipelines import (
+    ALL_PIPELINES,
+    Pipeline,
+    bwt_mtf_rle_rc,
+    mtf_rle_rc,
+    rle_rc,
+)
+from . import bitpack, bwt, mtf, rangecoder
 
 __all__ = [
     "Run",
@@ -10,5 +17,13 @@ __all__ = [
     "iter_runs",
     "SequenceRLE",
     "MathRLE",
+    "Pipeline",
+    "rle_rc",
+    "mtf_rle_rc",
+    "bwt_mtf_rle_rc",
+    "ALL_PIPELINES",
     "bitpack",
+    "bwt",
+    "mtf",
+    "rangecoder",
 ]

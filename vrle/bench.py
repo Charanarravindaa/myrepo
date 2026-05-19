@@ -1,156 +1,184 @@
-"""Bit-usage benchmarks across raw / plain-RLE / Vector-RLE representations.
+"""Head-to-head compression benchmark.
+
+Compares the three Vector-RLE pipelines against:
+  * raw bytes
+  * gzip      (stdlib)
+  * bz2       (stdlib)
+  * zstd      (optional dev dep)
+  * brotli    (optional dev dep)
+
+Every pipeline must round-trip; the harness asserts it and aborts loudly if
+not. Speed is intentionally not measured — these pipelines are Python and
+will lose every speed race; the interesting axis is bit ratio.
 
 Run with: ``python -m vrle.bench``
 """
 
 from __future__ import annotations
 
-import math
+import bz2
+import gzip
 import random
-from typing import Iterable, List, Tuple
+from pathlib import Path
+from typing import Callable, Dict, List, Tuple
 
-from .mathvec import MathRLE
-from .sequence import SequenceRLE
+from .pipelines import ALL_PIPELINES, Pipeline
 
+try:  # optional
+    import zstandard as _zstd  # type: ignore
 
-def _token_width(alphabet_size: int) -> int:
-    if alphabet_size <= 1:
-        return 1
-    return max(1, math.ceil(math.log2(alphabet_size)))
+    def _zstd_compress(data: bytes) -> bytes:
+        return _zstd.ZstdCompressor(level=22).compress(data)
 
+except Exception:  # pragma: no cover - optional dep
+    _zstd_compress = None  # type: ignore
 
-def _raw_bits(data: Iterable[int], token_width: int) -> int:
-    # consume into a length without materialising twice
-    n = sum(1 for _ in data)
-    return n * token_width
+try:  # optional
+    import brotli as _brotli  # type: ignore
 
+    def _brotli_compress(data: bytes) -> bytes:
+        return _brotli.compress(data, quality=11)
 
-def _plain_rle_bits(seq: SequenceRLE, token_width: int) -> int:
-    """Fixed-width baseline: token_width + 32-bit unsigned freq per run."""
-    return seq.bit_size(token_width, freq_encoding="raw32")
-
-
-def benchmark(name: str, data: List[int], alphabet_size: int) -> Tuple[str, dict]:
-    token_width = _token_width(alphabet_size)
-    seq = SequenceRLE.from_iterable(data)
-    mv = MathRLE.from_iterable(data)
-
-    raw = len(data) * token_width
-    plain = _plain_rle_bits(seq, token_width)
-    seq_leb = seq.bit_size(token_width, "leb128")
-    seq_gamma = seq.bit_size(token_width, "gamma")
-    mv_leb = mv.bit_size(token_width, "leb128")
-    mv_gamma = mv.bit_size(token_width, "gamma")
-
-    return name, {
-        "tokens": len(data),
-        "alphabet": alphabet_size,
-        "token_width": token_width,
-        "runs": len(seq.runs),
-        "raw_bits": raw,
-        "plain_rle_bits": plain,
-        "seq_rle_leb128_bits": seq_leb,
-        "seq_rle_gamma_bits": seq_gamma,
-        "mathvec_leb128_bits": mv_leb,
-        "mathvec_gamma_bits": mv_gamma,
-    }
+except Exception:  # pragma: no cover - optional dep
+    _brotli_compress = None  # type: ignore
 
 
-def _print_row(name: str, stats: dict) -> None:
-    raw = stats["raw_bits"]
-
-    def pct(bits: int) -> str:
-        if raw == 0:
-            return "  n/a"
-        return f"{100 * bits / raw:5.1f}%"
-
-    print(f"\n== {name} ==")
-    print(
-        f"  tokens={stats['tokens']:>7}  alphabet={stats['alphabet']:>4}  "
-        f"runs={stats['runs']:>6}  token_width={stats['token_width']} bits"
-    )
-    print(f"  {'raw':<22} {raw:>10} bits   ({pct(raw)} of raw)")
-    print(
-        f"  {'plain RLE (raw32)':<22} {stats['plain_rle_bits']:>10} bits   "
-        f"({pct(stats['plain_rle_bits'])} of raw)"
-    )
-    print(
-        f"  {'seq-RLE (LEB128)':<22} {stats['seq_rle_leb128_bits']:>10} bits   "
-        f"({pct(stats['seq_rle_leb128_bits'])} of raw)"
-    )
-    print(
-        f"  {'seq-RLE (gamma)':<22} {stats['seq_rle_gamma_bits']:>10} bits   "
-        f"({pct(stats['seq_rle_gamma_bits'])} of raw)"
-    )
-    print(
-        f"  {'mathvec (LEB128)':<22} {stats['mathvec_leb128_bits']:>10} bits   "
-        f"({pct(stats['mathvec_leb128_bits'])} of raw)  [order lost]"
-    )
-    print(
-        f"  {'mathvec (gamma)':<22} {stats['mathvec_gamma_bits']:>10} bits   "
-        f"({pct(stats['mathvec_gamma_bits'])} of raw)  [order lost]"
-    )
+Baseline = Tuple[str, Callable[[bytes], bytes]]
 
 
-def _gen_random_bytes(n: int, seed: int = 1) -> List[int]:
-    rng = random.Random(seed)
-    return [rng.randrange(256) for _ in range(n)]
-
-
-def _gen_long_runs(n: int, alphabet: int = 8, seed: int = 2) -> List[int]:
-    """Repetitive data with long runs — RLE's best case."""
-    rng = random.Random(seed)
-    out: List[int] = []
-    while len(out) < n:
-        tok = rng.randrange(alphabet)
-        run_len = rng.randint(20, 200)
-        out.extend([tok] * min(run_len, n - len(out)))
+def _baselines() -> List[Baseline]:
+    out: List[Baseline] = [
+        ("gzip(9)", lambda d: gzip.compress(d, compresslevel=9)),
+        ("bz2(9)", lambda d: bz2.compress(d, compresslevel=9)),
+    ]
+    if _zstd_compress is not None:
+        out.append(("zstd(22)", _zstd_compress))
+    else:
+        out.append(("zstd", None))  # type: ignore
+    if _brotli_compress is not None:
+        out.append(("brotli(11)", _brotli_compress))
+    else:
+        out.append(("brotli", None))  # type: ignore
     return out
 
 
-def _gen_text_like(n: int, seed: int = 3) -> List[int]:
-    """A mid-redundancy stream (English-letter-like distribution, short runs)."""
+def _measure(name: str, data: bytes) -> Dict[str, int]:
+    sizes: Dict[str, int] = {"raw": len(data)}
+    for p in ALL_PIPELINES:
+        blob = p.compress(data)
+        roundtrip = p.decompress(blob)
+        if roundtrip != data:
+            raise AssertionError(f"pipeline {p.name!r} failed round-trip on {name!r}")
+        sizes[p.name] = len(blob)
+    for label, fn in _baselines():
+        if fn is None:
+            sizes[label] = -1  # marker for "not installed"
+        else:
+            sizes[label] = len(fn(data))
+    return sizes
+
+
+def _print_table(name: str, sizes: Dict[str, int]) -> None:
+    raw = sizes["raw"]
+    print(f"\n== {name} ==  ({raw} bytes raw)")
+    print(f"  {'scheme':<18} {'bytes':>10}   {'% raw':>7}   {'% gzip':>7}")
+    gz = sizes.get("gzip(9)", -1)
+    for label, size in sizes.items():
+        if size < 0:
+            print(f"  {label:<18} {'(not installed)':>10}")
+            continue
+        pct_raw = f"{100 * size / raw:6.2f}%" if raw else "    n/a"
+        pct_gz = (
+            f"{100 * size / gz:6.2f}%" if gz > 0 and label != "gzip(9)" else ""
+        )
+        marker = "  <"  # winners get marked below in the summary
+        print(f"  {label:<18} {size:>10}   {pct_raw:>7}   {pct_gz:>7}")
+    # Summary line — the smallest scheme.
+    best = min(
+        (sz, label) for label, sz in sizes.items() if sz > 0 and label != "raw"
+    )
+    print(f"  winner: {best[1]} ({best[0]} bytes)")
+
+
+# ---------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------
+
+
+def _rand_bytes(n: int, seed: int) -> bytes:
     rng = random.Random(seed)
-    # Skewed alphabet of 27 tokens (a-z + space)
+    return bytes(rng.randrange(256) for _ in range(n))
+
+
+def _long_runs(n: int, alphabet: int = 8, seed: int = 2) -> bytes:
+    rng = random.Random(seed)
+    out = bytearray()
+    while len(out) < n:
+        tok = rng.randrange(alphabet)
+        run = rng.randint(20, 200)
+        out.extend([tok] * min(run, n - len(out)))
+    return bytes(out)
+
+
+def _text_like(n: int, seed: int = 3) -> bytes:
+    rng = random.Random(seed)
+    # English-letter-like frequencies, lowercase + space.
+    population = list(range(ord("a"), ord("a") + 26)) + [ord(" ")]
     weights = [
         8.2, 1.5, 2.8, 4.3, 12.7, 2.2, 2.0, 6.1, 7.0, 0.2, 0.8,
         4.0, 2.4, 6.7, 7.5, 1.9, 0.1, 6.0, 6.3, 9.1, 2.8, 1.0,
         2.4, 0.2, 2.0, 0.1, 18.3,
     ]
-    population = list(range(27))
-    return rng.choices(population, weights=weights, k=n)
+    return bytes(rng.choices(population, weights=weights, k=n))
 
 
-def _gen_log_lines(n_lines: int = 200) -> List[int]:
-    """A repetitive token stream like web-server logs (status code repeated)."""
-    rng = random.Random(4)
-    stream: List[int] = []
-    statuses = [200, 200, 200, 200, 200, 200, 200, 301, 404, 500]
+def _log_stream(n_lines: int = 500, seed: int = 4) -> bytes:
+    rng = random.Random(seed)
+    lines = []
+    methods = ["GET", "POST", "PUT", "GET", "GET", "GET"]
+    paths = ["/", "/index.html", "/api/v1/users", "/static/app.css", "/favicon.ico"]
+    statuses = [200, 200, 200, 200, 200, 301, 404, 500]
     for _ in range(n_lines):
-        run = rng.randint(5, 50)
-        s = rng.choice(statuses)
-        stream.extend([s] * run)
-    return stream
+        lines.append(
+            f"{rng.choice(methods)} {rng.choice(paths)} HTTP/1.1 {rng.choice(statuses)}\n"
+        )
+    return "".join(lines).encode()
+
+
+def _load_sample_text() -> bytes:
+    p = Path(__file__).resolve().parent.parent / "examples" / "data" / "sample.txt"
+    if p.is_file():
+        return p.read_bytes()
+    return b""
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    print("Vector-RLE bit-usage benchmark")
-    print("==============================")
+    print("Vector-RLE v2 benchmark")
+    print("=======================")
+    print(
+        "Pipelines: "
+        + ", ".join(p.name for p in ALL_PIPELINES)
+        + "; baselines: raw, gzip, bz2, zstd, brotli"
+    )
 
-    for name, data, alphabet in [
-        ("Random bytes (worst case, no runs)", _gen_random_bytes(20_000), 256),
-        ("High-redundancy bytes (long runs)", _gen_long_runs(20_000, 8), 8),
-        ("Text-like English chars", _gen_text_like(20_000), 27),
-        ("Repetitive log-status stream", _gen_log_lines(500), 600),
-    ]:
-        _, stats = benchmark(name, data, alphabet)
-        _print_row(name, stats)
+    datasets: List[Tuple[str, bytes]] = [
+        ("Random bytes (incompressible)", _rand_bytes(20_000, 1)),
+        ("High-redundancy bytes (long runs)", _long_runs(20_000)),
+        ("English-letter-frequency text", _text_like(20_000)),
+        ("Synthetic web log stream", _log_stream(500)),
+    ]
+    real_text = _load_sample_text()
+    if real_text:
+        datasets.append(("Real English prose (Pride & Prejudice excerpt)", real_text))
 
-    print()
-    print("Notes:")
-    print("  - 'plain RLE' uses fixed-width tokens + 32-bit unsigned freq.")
-    print("  - 'seq-RLE' (LEB128/gamma) is the Vector-RLE sequence form.")
-    print("  - 'mathvec' discards positional order (counts per token only).")
+    for name, data in datasets:
+        sizes = _measure(name, data)
+        _print_table(name, sizes)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ authors = [{ name = "vrle authors" }]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "zstandard>=0.22", "brotli>=1.1"]
 
 [tool.setuptools]
 packages = ["vrle"]
