@@ -23,7 +23,7 @@ WINDOW = 32 * 1024
 MIN_MATCH = 3
 MAX_MATCH = 258
 HASH_BITS = 15
-MAX_CHAIN = 128
+MAX_CHAIN = 1024  # deflate -9 uses 4096; 1024 is the sweet spot for pure Python
 
 
 def lz77_encode(
@@ -33,6 +33,7 @@ def lz77_encode(
     max_match: int = MAX_MATCH,
     hash_bits: int = HASH_BITS,
     max_chain: int = MAX_CHAIN,
+    lazy: bool = True,
 ) -> Tuple[List[int], List[int], List[int], List[int]]:
     n = len(data)
     if n == 0:
@@ -56,42 +57,62 @@ def lz77_encode(
         head[hv] = p
         return chain
 
+    def find_match(pos: int, chain_start: int) -> Tuple[int, int]:
+        if chain_start < 0 or pos + min_match > n:
+            return 0, 0
+        cand = chain_start
+        count = 0
+        limit = min(max_match, n - pos)
+        target_first = data[pos : pos + min_match]
+        best_len = 0
+        best_dist = 0
+        while cand >= 0 and pos - cand <= window and count < max_chain:
+            if data[cand : cand + min_match] == target_first:
+                m = min_match
+                while m < limit and data[cand + m] == data[pos + m]:
+                    m += 1
+                if m > best_len:
+                    best_len = m
+                    best_dist = pos - cand
+                    if m == max_match:
+                        break
+            cand = prev[cand]
+            count += 1
+        return best_len, best_dist
+
+    def emit_intermediate_hashes(start: int, length: int) -> None:
+        """Insert hashes for positions start..start+length-1 (skipping start itself)."""
+        for k in range(1, length):
+            p = start + k
+            if p + min_match > n:
+                break
+            insert_hash(p)
+
     pos = 0
     while pos < n:
         chain_start = insert_hash(pos)
+        best_len, best_dist = find_match(pos, chain_start)
 
-        best_len = 0
-        best_dist = 0
-        if chain_start >= 0:
-            cand = chain_start
-            count = 0
-            limit = min(max_match, n - pos)
-            target_first = data[pos : pos + min_match]
-            while cand >= 0 and pos - cand <= window and count < max_chain:
-                if data[cand : cand + min_match] == target_first:
-                    # Extend match
-                    m = min_match
-                    while m < limit and data[cand + m] == data[pos + m]:
-                        m += 1
-                    if m > best_len:
-                        best_len = m
-                        best_dist = pos - cand
-                        if m == max_match:
-                            break
-                cand = prev[cand]
-                count += 1
+        if lazy and best_len >= min_match and pos + 1 < n:
+            # Look one byte ahead: if a longer match starts at pos+1, emit
+            # pos as a literal and use the longer match.
+            next_chain = insert_hash(pos + 1)
+            next_len, next_dist = find_match(pos + 1, next_chain)
+            if next_len > best_len:
+                controls.append(0)
+                literals.append(data[pos])
+                controls.append(1)
+                lengths.append(next_len)
+                distances.append(next_dist)
+                emit_intermediate_hashes(pos + 1, next_len)
+                pos += 1 + next_len
+                continue
 
         if best_len >= min_match:
             controls.append(1)
             lengths.append(best_len)
             distances.append(best_dist)
-            # Insert hashes for the bytes we're skipping, so future matches
-            # can still find them.
-            for k in range(1, best_len):
-                p = pos + k
-                if p + min_match > n:
-                    break
-                insert_hash(p)
+            emit_intermediate_hashes(pos, best_len)
             pos += best_len
         else:
             controls.append(0)

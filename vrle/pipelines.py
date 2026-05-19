@@ -18,9 +18,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .bitpack import leb128_decode, leb128_encode
+from .bitpack import BitReader, BitWriter, leb128_decode, leb128_encode
 from .bwt import bwt_decode, bwt_encode
 from .core import Run, decode_runs, encode_runs
+from .deflate_codes import (
+    LENGTH_CODES,
+    N_DISTANCE_CODES,
+    code_to_distance,
+    code_to_length,
+    distance_extra_bits,
+    distance_to_code,
+    length_extra_bits,
+    length_to_code,
+)
 from .lz import lz77_decode, lz77_encode
 from .mtf import mtf_decode, mtf_encode
 from .rangecoder import decode_stream, encode_stream
@@ -307,4 +317,110 @@ lz_bwt_mtf_rle_rc = Pipeline(
 )
 
 
-ALL_PIPELINES = [rle_rc, mtf_rle_rc, bwt_mtf_rle_rc, lz_rc, lz_bwt_mtf_rle_rc]
+# ---------------------------------------------------------------------------
+# Pipeline F: LZ77 with deflate-style bin codes + arithmetic coding
+# ---------------------------------------------------------------------------
+# This is the part naive `lz_rc` was missing. Lengths and distances are
+# emitted as small bin codes (entropy-coded against a tight alphabet) plus
+# a few raw extra bits. About 1 byte per match pair instead of ~1.5–2.
+# Literals and length codes share one combined alphabet of 285 symbols
+# (deflate's literal/length code).
+#
+# Stream layout in the blob:
+#   leb128(input_len)
+#   encode_stream(litlen_symbols, alphabet=285)   # literals 0..255, lengths 256..284
+#   encode_stream(dist_codes,    alphabet=30)
+#   leb128(extras_n_bits) || leb128(extras_byte_len) || extras_bytes
+
+
+LITLEN_ALPHABET = 256 + len(LENGTH_CODES)  # 256 literals + 29 length codes = 285
+
+
+def _compress_deflate_rc(data: bytes) -> bytes:
+    out = bytearray()
+    out += leb128_encode(len(data))
+    if not data:
+        return bytes(out)
+
+    controls, literals, lengths, distances = lz77_encode(data)
+    litlen_symbols: list[int] = []
+    dist_codes: list[int] = []
+    extras = BitWriter()
+
+    lit_i = 0
+    match_i = 0
+    for c in controls:
+        if c == 0:
+            litlen_symbols.append(literals[lit_i])
+            lit_i += 1
+        else:
+            L = lengths[match_i]
+            D = distances[match_i]
+            match_i += 1
+            l_code, l_extra, l_bits = length_to_code(L)
+            litlen_symbols.append(256 + l_code)
+            if l_bits:
+                extras.write_bits(l_extra, l_bits)
+            d_code, d_extra, d_bits = distance_to_code(D)
+            dist_codes.append(d_code)
+            if d_bits:
+                extras.write_bits(d_extra, d_bits)
+
+    out += encode_stream(litlen_symbols, alphabet_size=LITLEN_ALPHABET)
+    out += encode_stream(dist_codes, alphabet_size=N_DISTANCE_CODES)
+    extras_bytes = extras.to_bytes()
+    out += leb128_encode(len(extras))           # bit length
+    out += leb128_encode(len(extras_bytes))     # byte length
+    out += extras_bytes
+    return bytes(out)
+
+
+def _decompress_deflate_rc(blob: bytes) -> bytes:
+    pos = 0
+    input_len, pos = leb128_decode(blob, pos)
+    if input_len == 0:
+        return b""
+
+    litlen_symbols, pos = decode_stream(blob, pos)
+    dist_codes, pos = decode_stream(blob, pos)
+    extras_n_bits, pos = leb128_decode(blob, pos)
+    extras_byte_len, pos = leb128_decode(blob, pos)
+    extras = BitReader(blob[pos : pos + extras_byte_len], extras_n_bits)
+    pos += extras_byte_len
+
+    out = bytearray()
+    dist_i = 0
+    for sym in litlen_symbols:
+        if sym < 256:
+            out.append(sym)
+            continue
+        l_code = sym - 256
+        l_bits = length_extra_bits(l_code)
+        l_extra = extras.read_bits(l_bits) if l_bits else 0
+        length = code_to_length(l_code, l_extra)
+
+        d_code = dist_codes[dist_i]
+        dist_i += 1
+        d_bits = distance_extra_bits(d_code)
+        d_extra = extras.read_bits(d_bits) if d_bits else 0
+        distance = code_to_distance(d_code, d_extra)
+
+        start = len(out) - distance
+        for i in range(length):
+            out.append(out[start + i])
+
+    assert len(out) == input_len, "deflate_rc length mismatch on decode"
+    return bytes(out)
+
+
+deflate_rc = Pipeline("deflate_rc", _compress_deflate_rc, _decompress_deflate_rc)
+
+
+ALL_PIPELINES = [
+    rle_rc,
+    mtf_rle_rc,
+    bwt_mtf_rle_rc,
+    lz_rc,
+    lz_bwt_mtf_rle_rc,
+    deflate_rc,
+]
