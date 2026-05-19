@@ -18,7 +18,7 @@ zstd, and brotli.
 encoded streams. `SequenceRLE` is the round-trippable form that the
 compression pipelines build on.
 
-## Three compression pipelines
+## Five compression pipelines
 
 All operate on byte streams, preserve order, and round-trip losslessly.
 
@@ -28,11 +28,17 @@ All operate on byte streams, preserve order, and round-trip losslessly.
   locality which RLE/entropy then exploits.
 * **`bwt_mtf_rle_rc`** — the classic bzip2 stack with Vector-RLE plugged
   in: BWT → MTF → SequenceRLE → arithmetic coding.
+* **`lz_rc`** — LZ77 sliding-window matches, then arithmetic-code the
+  four streams (controls, literals, lengths, distances).
+* **`lz_bwt_mtf_rle_rc`** — LZ77 first, then put the residual *literals*
+  through the BWT+MTF+RLE stack. Word-level redundancy via LZ77,
+  character-level via BWT.
 
 Components:
 * `vrle/bwt.py` — Burrows–Wheeler Transform (naive `O(n² log n)` — fine
   for the ≤100 KB benchmark inputs).
 * `vrle/mtf.py` — Move-To-Front transform.
+* `vrle/lz.py` — LZ77 with a hash-chain matcher.
 * `vrle/rangecoder.py` — 32-bit bit-oriented arithmetic coder with a
   semi-adaptive byte model (histogram in the header).
 
@@ -55,6 +61,19 @@ Honest summary:
   brotli) win because word-level redundancy isn't captured by RLE/BWT.
 * On **incompressible (random) data**, our pipelines add ~3% header
   overhead — comparable to bz2.
+
+### What we learned from adding LZ77
+
+The two LZ77-based pipelines (`lz_rc` and `lz_bwt_mtf_rle_rc`) **did not
+beat the BWT stack** on any dataset in the benchmark. The reason is
+illuminating: gzip's win over BWT on natural text comes from finely tuned
+length/distance codes (bin codes + extra bits, Huffman-coded), not from
+LZ77 itself. Our naive LZ77 emits each `(length, distance)` as LEB128
+bytes through arithmetic coding — correct but wasteful: 1.5–2 bytes per
+match pair, vs. gzip's ~1 byte after Huffman. The extra match overhead
+swamps the entropy savings. A full LZ77 + deflate-style code stack would
+likely close the gap on prose, but is a much bigger project. For now the
+LZ pipelines stay in the repo as the honest "we tried it" reference.
 
 ## Quick start
 
@@ -103,11 +122,12 @@ vrle/
   bitpack.py     LEB128 + Elias gamma + low-level bit I/O
   bwt.py         Burrows–Wheeler Transform
   mtf.py         Move-To-Front transform
+  lz.py          LZ77 sliding-window matcher (hash chain, no lazy match)
   rangecoder.py  Arithmetic coder + semi-adaptive byte model
-  pipelines.py   rle_rc, mtf_rle_rc, bwt_mtf_rle_rc
+  pipelines.py   rle_rc, mtf_rle_rc, bwt_mtf_rle_rc, lz_rc, lz_bwt_mtf_rle_rc
   bench.py       Head-to-head benchmark vs gzip/bz2/zstd/brotli
 examples/
   compare.py     CLI wrapper
   data/sample.txt  Pride & Prejudice excerpt (public domain)
-tests/           120 tests covering round-trips and arithmetic
+tests/           150 tests covering round-trips and arithmetic
 ```

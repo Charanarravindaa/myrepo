@@ -2,7 +2,7 @@ import random
 
 import pytest
 
-from vrle.pipelines import ALL_PIPELINES, bwt_mtf_rle_rc, mtf_rle_rc, rle_rc
+from vrle.pipelines import ALL_PIPELINES, bwt_mtf_rle_rc, lz_rc, mtf_rle_rc, rle_rc
 
 
 SAMPLES = [
@@ -50,6 +50,16 @@ def test_rle_rc_beats_naive_on_runs():
     assert rle_rc.decompress(blob) == data
     # Trivially: 3 000 bytes -> some tens of bytes.
     assert len(blob) < 200
+
+
+def test_lz_rc_captures_repeated_phrase():
+    """LZ77 should crush data with repeated multi-byte phrases."""
+    data = b"the quick brown fox jumps over the lazy dog. " * 200
+    blob = lz_rc.compress(data)
+    assert lz_rc.decompress(blob) == data
+    # Pure RLE can't help here (no adjacent equal bytes), so this is the
+    # case where LZ77 shines.
+    assert len(blob) < len(data) // 10
 
 
 def test_pipelines_dont_blow_up_on_random():

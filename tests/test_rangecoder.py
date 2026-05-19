@@ -68,9 +68,11 @@ def test_roundtrip_skewed_distribution():
 
 def test_empty_stream():
     blob = encode_stream([], 256)
-    assert blob == b""
-    decoded, _ = decode_stream(blob)
+    # Self-delimiting: empty stream costs exactly one leb128(0) byte.
+    assert blob == b"\x00"
+    decoded, pos = decode_stream(blob)
     assert decoded == []
+    assert pos == 1
 
 
 def test_build_frequency_table_scales_when_oversized():

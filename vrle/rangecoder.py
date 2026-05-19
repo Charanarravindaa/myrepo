@@ -254,19 +254,20 @@ class ArithmeticDecoder:
 def encode_stream(symbols: List[int], alphabet_size: int) -> bytes:
     """Encode `symbols` to a self-contained byte string.
 
-    Layout: leb128(n_symbols) || encode_table(model) || leb128(n_bits) || payload.
-    Returns an empty-stream sentinel `b""` if `symbols` is empty.
+    Layout: leb128(n_symbols) [|| encode_table(model) || leb128(n_bits) ||
+    leb128(payload_len) || payload].  The leading symbol-count is always
+    present so an empty stream still consumes one byte and decoders can
+    chain calls via the returned position.
     """
+    out = bytearray()
+    out += leb128_encode(len(symbols))
     if not symbols:
-        return b""
+        return bytes(out)
     table = build_frequency_table(symbols, alphabet_size)
     enc = ArithmeticEncoder()
     for s in symbols:
         enc.encode(table, s)
     payload, n_bits = enc.finish()
-
-    out = bytearray()
-    out += leb128_encode(len(symbols))
     out += encode_table(table)
     out += leb128_encode(n_bits)
     out += leb128_encode(len(payload))
@@ -275,9 +276,9 @@ def encode_stream(symbols: List[int], alphabet_size: int) -> bytes:
 
 
 def decode_stream(buf: bytes, pos: int = 0) -> Tuple[List[int], int]:
-    if pos >= len(buf):
-        return [], pos
     n_symbols, pos = leb128_decode(buf, pos)
+    if n_symbols == 0:
+        return [], pos
     table, pos = decode_table(buf, pos)
     n_bits, pos = leb128_decode(buf, pos)
     payload_len, pos = leb128_decode(buf, pos)
