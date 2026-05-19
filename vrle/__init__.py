@@ -5,13 +5,15 @@ from .pipelines import (
     ALL_PIPELINES,
     Pipeline,
     bwt_mtf_rle_rc,
+    bwt_ppm_rc,
     deflate_rc,
     lz_bwt_mtf_rle_rc,
     lz_rc,
     mtf_rle_rc,
+    ppm_rc,
     rle_rc,
 )
-from . import bitpack, bwt, deflate_codes, lz, mtf, rangecoder
+from . import bitpack, bwt, deflate_codes, lz, mtf, ppm, rangecoder
 
 __all__ = [
     "Run",
@@ -27,10 +29,13 @@ __all__ = [
     "lz_rc",
     "lz_bwt_mtf_rle_rc",
     "deflate_rc",
+    "ppm_rc",
+    "bwt_ppm_rc",
     "ALL_PIPELINES",
     "bitpack",
     "bwt",
     "lz",
     "mtf",
+    "ppm",
     "rangecoder",
 ]

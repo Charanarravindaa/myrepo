@@ -33,6 +33,7 @@ from .deflate_codes import (
 )
 from .lz import lz77_decode, lz77_encode
 from .mtf import mtf_decode, mtf_encode
+from .ppm import decode_ppm_stream, encode_ppm_stream
 from .rangecoder import (
     decode_adaptive_stream as decode_stream,
     encode_adaptive_stream as encode_stream,
@@ -419,6 +420,60 @@ def _decompress_deflate_rc(blob: bytes) -> bytes:
 deflate_rc = Pipeline("deflate_rc", _compress_deflate_rc, _decompress_deflate_rc)
 
 
+# ---------------------------------------------------------------------------
+# Pipeline G: PPM (order-4 context model) directly on the byte stream
+# ---------------------------------------------------------------------------
+# No LZ77, no BWT — just an adaptive order-N statistical model + arithmetic
+# coding. Strongest pipeline on natural text where word-level repetition
+# would be sparse but byte-level conditional probabilities are rich.
+
+
+def _compress_ppm_rc(data: bytes) -> bytes:
+    return encode_ppm_stream(data, order=4)
+
+
+def _decompress_ppm_rc(blob: bytes) -> bytes:
+    out, _ = decode_ppm_stream(blob)
+    return out
+
+
+ppm_rc = Pipeline("ppm_rc", _compress_ppm_rc, _decompress_ppm_rc)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline H: BWT + MTF + PPM (low-order context on the clustered stream)
+# ---------------------------------------------------------------------------
+# After BWT+MTF the byte stream is heavily skewed toward small values
+# (especially 0). A low-order PPM (order 2) on this is often a stronger
+# entropy step than the RLE+arith chain.
+
+
+def _compress_bwt_ppm_rc(data: bytes) -> bytes:
+    out = bytearray()
+    out += leb128_encode(len(data))
+    if not data:
+        return bytes(out)
+    bwt_out, primary = bwt_encode(data)
+    mtf_out = mtf_encode(bwt_out)
+    out += leb128_encode(primary)
+    out += encode_ppm_stream(mtf_out, order=2)
+    return bytes(out)
+
+
+def _decompress_bwt_ppm_rc(blob: bytes) -> bytes:
+    pos = 0
+    input_len, pos = leb128_decode(blob, pos)
+    if input_len == 0:
+        return b""
+    primary, pos = leb128_decode(blob, pos)
+    mtf_out, pos = decode_ppm_stream(blob, pos)
+    bwt_out = mtf_decode(mtf_out)
+    return bwt_decode(bwt_out, primary)
+
+
+bwt_ppm_rc = Pipeline("bwt_ppm_rc", _compress_bwt_ppm_rc, _decompress_bwt_ppm_rc)
+
+
 ALL_PIPELINES = [
     rle_rc,
     mtf_rle_rc,
@@ -426,4 +481,6 @@ ALL_PIPELINES = [
     lz_rc,
     lz_bwt_mtf_rle_rc,
     deflate_rc,
+    ppm_rc,
+    bwt_ppm_rc,
 ]
