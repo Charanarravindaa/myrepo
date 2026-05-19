@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "Cython>=3.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,7 +13,8 @@ authors = [{ name = "vrle authors" }]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "zstandard>=0.22", "brotli>=1.1"]
+dev = ["pytest>=7", "zstandard>=0.22", "brotli>=1.1", "Cython>=3.0"]
 
 [tool.setuptools]
 packages = ["vrle"]
+package-data = { vrle = ["dicts/*.dict", "*.pyx"] }

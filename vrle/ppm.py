@@ -29,6 +29,15 @@ from .rangecoder import (
     ArithmeticEncoder,
 )
 
+# Optional Cython acceleration for the alphabet-sized inner loops. Falls
+# back to pure-Python implementations if the extension isn't built.
+try:
+    from . import _ppm_native as _native  # type: ignore[attr-defined]
+    HAVE_NATIVE = True
+except ImportError:  # pragma: no cover
+    _native = None
+    HAVE_NATIVE = False
+
 
 class PPMContext:
     """Direct count vector for a single context. Length = alphabet+1
@@ -91,9 +100,13 @@ def _encode_loop(
     history: List[int] = []
     excluded = bytearray(table_size)
 
+    use_native = HAVE_NATIVE
     for sym in symbols:
-        for i in range(table_size):
-            excluded[i] = 0
+        if use_native:
+            _native.reset_excluded(excluded)
+        else:
+            for i in range(table_size):
+                excluded[i] = 0
 
         for k in range(min(order, len(history)), -1, -1):
             ctx = contexts[k].get(_ctx_key(history, k))
@@ -102,32 +115,44 @@ def _encode_loop(
             counts = ctx.counts
 
             # Effective total under exclusion.
-            eff_total = 0
-            for i in range(table_size):
-                if not excluded[i]:
-                    eff_total += counts[i]
+            if use_native:
+                eff_total = _native.eff_total(counts, excluded)
+            else:
+                eff_total = 0
+                for i in range(table_size):
+                    if not excluded[i]:
+                        eff_total += counts[i]
             if eff_total <= 0:
                 continue
 
             if not excluded[sym] and counts[sym] > 0:
-                lo = 0
-                for i in range(sym):
-                    if not excluded[i]:
-                        lo += counts[i]
+                if use_native:
+                    lo = _native.eff_cumul_lo(counts, excluded, sym)
+                else:
+                    lo = 0
+                    for i in range(sym):
+                        if not excluded[i]:
+                            lo += counts[i]
                 enc.encode_freq(lo, lo + counts[sym], eff_total)
                 break
 
             esc_count = counts[esc]
             if esc_count > 0:
-                lo = 0
-                for i in range(esc):
-                    if not excluded[i]:
-                        lo += counts[i]
+                if use_native:
+                    lo = _native.eff_cumul_lo(counts, excluded, esc)
+                else:
+                    lo = 0
+                    for i in range(esc):
+                        if not excluded[i]:
+                            lo += counts[i]
                 enc.encode_freq(lo, lo + esc_count, eff_total)
 
-            for i in range(esc):
-                if counts[i] > 0:
-                    excluded[i] = 1
+            if use_native:
+                _native.mark_excluded(excluded, counts, esc)
+            else:
+                for i in range(esc):
+                    if counts[i] > 0:
+                        excluded[i] = 1
 
         # Update every context (no exclusion in updates).
         for k in range(min(order, len(history)), -1, -1):
@@ -161,9 +186,13 @@ def _decode_loop(
     history: List[int] = []
     excluded = bytearray(table_size)
 
+    use_native = HAVE_NATIVE
     for _ in range(n_symbols):
-        for i in range(table_size):
-            excluded[i] = 0
+        if use_native:
+            _native.reset_excluded(excluded)
+        else:
+            for i in range(table_size):
+                excluded[i] = 0
         sym = -1
 
         for k in range(min(order, len(history)), -1, -1):
@@ -173,30 +202,39 @@ def _decode_loop(
             counts = ctx.counts
 
             # Build effective cumulative array.
-            eff_cumul = [0] * (table_size + 1)
-            for i in range(table_size):
-                eff_cumul[i + 1] = eff_cumul[i] + (
-                    0 if excluded[i] else counts[i]
-                )
+            if use_native:
+                eff_cumul = _native.build_eff_cumul(counts, excluded)
+            else:
+                eff_cumul = [0] * (table_size + 1)
+                for i in range(table_size):
+                    eff_cumul[i + 1] = eff_cumul[i] + (
+                        0 if excluded[i] else counts[i]
+                    )
             eff_total = eff_cumul[-1]
             if eff_total <= 0:
                 continue
 
             scaled = dec.scale_value(eff_total)
-            lo_i, hi_i = 0, table_size - 1
-            while lo_i < hi_i:
-                mid = (lo_i + hi_i + 1) // 2
-                if eff_cumul[mid] <= scaled:
-                    lo_i = mid
-                else:
-                    hi_i = mid - 1
-            s = lo_i
+            if use_native:
+                s = _native.find_sym_in_cumul(eff_cumul, scaled, table_size)
+            else:
+                lo_i, hi_i = 0, table_size - 1
+                while lo_i < hi_i:
+                    mid = (lo_i + hi_i + 1) // 2
+                    if eff_cumul[mid] <= scaled:
+                        lo_i = mid
+                    else:
+                        hi_i = mid - 1
+                s = lo_i
 
             dec.consume_freq(eff_cumul[s], eff_cumul[s + 1], eff_total)
             if s == esc:
-                for i in range(esc):
-                    if counts[i] > 0:
-                        excluded[i] = 1
+                if use_native:
+                    _native.mark_excluded(excluded, counts, esc)
+                else:
+                    for i in range(esc):
+                        if counts[i] > 0:
+                            excluded[i] = 1
                 continue
             sym = s
             break

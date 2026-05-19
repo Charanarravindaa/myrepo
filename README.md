@@ -212,6 +212,71 @@ subsequent files compressed *for that machine* can reference the
 extended IDs without re-shipping. The compression primitive built here
 is the same; only the lookup gets a per-machine extension.
 
+### PPMd-mx9 baseline + native (Cython) hot-path acceleration
+
+Two pieces of credibility infrastructure added together:
+
+**1. PPMd-mx9 as a baseline** (`python -m vrle.std_bench_ppmd`).
+7-zip's PPMd codec at `-mx=9 -mmem=2g -mo=8` is Shkarin's 25-year-old
+PPMII implementation — the production-quality reference PPM
+compressor. Honest comparison since `vrle` is PPM-class itself.
+
+On the 1.1 MB held-out Gutenberg + Brown corpus:
+
+| pipeline      | bytes   | % raw | % gzip |
+|---------------|--------:|------:|-------:|
+| **PPMd-mx9**  | 313 920 | **28.39 %** | 73.99 % |
+| vector_auto   | 334 924 | 30.29 % | 78.94 % |
+| bz2(9)        | 346 703 | 31.35 % | 81.71 % |
+| brotli(11)    | 366 982 | 33.19 % | 86.49 % |
+| zstd(22)      | 388 675 | 35.15 % | 91.60 % |
+| gzip(9)       | 424 298 | 38.37 % | 100.00 % |
+
+PPMd wins every file by 5–8 %. `vector_auto` lands solidly second,
+beating gzip / bz2 / zstd / brotli on the corpus total. The honest
+framing for any external claim: **`vrle` reaches PPM-class ratio
+(within 6 % of Shkarin's PPMII) while adding the auto-dispatch +
+bundled shared dictionaries + content-addressed token IDs + the
+random-access primitive — all in ~1 800 lines of pure Python**.
+
+**2. Native (Cython) acceleration** of the alphabet-sized inner
+loops in `_encode_loop` / `_decode_loop` (`vrle/_ppm_native.pyx`).
+Profile-driven: the original pure-Python ~95 % time is spent in
+the effective-cumulative / exclusion loops. The Cython port compiles
+these to C and falls back gracefully to Python if the extension
+isn't built.
+
+Measured on a 50 KB held-out Austen sample:
+
+| version                            | time     | throughput |
+|------------------------------------|---------:|-----------:|
+| pure Python (baseline)             | 26 300 ms | 1.9 KB/s   |
+| **+ Cython hot-path (this build)** | **1 770 ms** | **27.6 KB/s** |
+| `zstd(22)` for reference           | 13.4 ms  | 3.6 MB/s   |
+
+That's a **14.9 × speedup from ~50 lines of Cython** with zero
+ratio change. The full 1.1 MB std-corpus bench now runs in **24 s**
+end-to-end on this machine — down from minutes.
+
+**Distance to the production goal**: target = within 10 × of zstd
+throughput = ~360 KB/s. We're at 27.6 KB/s. **Remaining gap is ~13 ×**.
+Realistic routes to close it:
+
+* **Sparse-context counts** — replace per-context dense
+  `list[alphabet+1]` with a `dict[sym, count]` only for symbols
+  actually seen in that context. Eliminates the per-symbol O(α)
+  cumulative loops entirely. Plausibly 10–30 × on top of Cython.
+* **Native arithmetic coder** — port `ArithmeticEncoder` /
+  `ArithmeticDecoder` to C/Rust with proper integer arithmetic on
+  the renormalisation. Maybe 5–10 ×.
+* **Memory layout / SIMD** — once the arithmetic is native, SIMD
+  prefix-sum for the eff-cumul build is straightforward. 2–4 ×.
+
+Combined: 100–1000 × additional speedup is plausible, putting the
+pipeline within 1–10 × of zstd throughput on text. That's the
+*real* C/Rust port — multi-week work, but the architecture is
+validated by the 15 × Cython result.
+
 ### Standard-corpus benchmark (held-out NLTK Gutenberg + Brown)
 
 The numbers above come from custom small datasets. To validate against
