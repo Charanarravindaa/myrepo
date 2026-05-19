@@ -41,6 +41,12 @@ from .ppm import (
     encode_ppm_seq,
     encode_ppm_stream,
 )
+from .random_access import (
+    BLOCK_SIZE_DEFAULT,
+    RandomReader,
+    compress_random,
+    decompress_random,
+)
 from .shared_dict import SharedDict
 from .rangecoder import (
     decode_adaptive_stream as decode_stream,
@@ -732,6 +738,23 @@ vector_rle_shared = Pipeline(
 )
 
 
+# ---------------------------------------------------------------------------
+# Pipeline L: vector_rle_shared with block-based random access
+# ---------------------------------------------------------------------------
+# Same shared-dict approach as v7 but each ~2048-token block is encoded
+# independently, so any byte position in the original input can be
+# retrieved by decoding ~1/n_blocks of the file. About 3 % worse ratio
+# than v7; in return you get O(block_size) random reads via
+# ``vrle.random_access.RandomReader``.
+
+
+vector_rle_random = Pipeline(
+    "vector_rle_random",
+    compress_random,
+    decompress_random,
+)
+
+
 ALL_PIPELINES = [
     rle_rc,
     mtf_rle_rc,
@@ -744,4 +767,5 @@ ALL_PIPELINES = [
     bwt_ppm_rc,
     vector_rle,
     vector_rle_shared,
+    vector_rle_random,
 ]

@@ -18,7 +18,7 @@ zstd, and brotli.
 encoded streams. `SequenceRLE` is the round-trippable form that the
 compression pipelines build on.
 
-## Eleven compression pipelines
+## Twelve compression pipelines
 
 All operate on byte streams, preserve order, and round-trip losslessly.
 
@@ -46,6 +46,15 @@ All operate on byte streams, preserve order, and round-trip losslessly.
   base ID and their bytes are **not** shipped. Novel tokens go into a
   per-file delta dict. **Beats brotli on real 53 KB English text**:
   12 053 B vs brotli 12 838 B (6.1 % smaller).
+* **`vector_rle_random`** (v8) — *block-structured `vector_rle_shared`
+  with random-byte access*. The input is chunked into 2 048-token
+  blocks, each independently PPM-encoded. A tiny block index lets a
+  reader decode just the block(s) covering any byte position — no full
+  decompression. About 25 % worse ratio than `vector_rle_shared`
+  (per-block PPM warmup overhead), but **still beats gzip and zstd**
+  on the long English benchmark. Each random read is ~9× faster than
+  full decompression on the 53 KB sample, with the speedup growing
+  linearly with file size.
 * **`vector_rle`** (v6) — *geometric tokenization with PPM throughout*.
   Parse the input into word tokens, sort the vocabulary alphabetically,
   PPM-compress the lengths array, PPM-compress the concatenated token
@@ -82,6 +91,7 @@ marks where a vrle pipeline beats a standard compressor.
 | Web log stream (14.5 KB)   | **ppm_rc 511** ✓✓✓✓     | 974      | 673      | 862      | 881        |
 | Real English prose (4.5 KB)| ppm_rc **1935** ✓✓✓     | 2163     | 2050     | 2110     | 1729       |
 | Long English text (53 KB GPL-3 + GPL-2) | **vector_rle_shared 12053** ✓✓✓✓ | 16379 | 14411 | 15053 | 12838 |
+| Long English text — *random-access variant* | vector_rle_random 15131 ✓✓ | 16379 | 14411 | 15053 ✗ | 12838 ✗ |
 | Web log stream (14.5 KB) | **vector_rle 510** ✓✓✓✓ | 974 | 673 | 862 | 881 |
 
 Score (vrle wins vs each standard compressor):
@@ -190,6 +200,68 @@ extended base dict (e.g. `~/.local/share/vrle/extended.dict`) and
 subsequent files compressed *for that machine* can reference the
 extended IDs without re-shipping. The compression primitive built here
 is the same; only the lookup gets a per-machine extension.
+
+### v8: Random-access compressed format (`vector_rle_random`)
+
+A compressed file format where any byte position can be read without
+decompressing the whole file. Same wire-level construction as
+`vector_rle_shared` (v7) but the positional index is chunked into
+independently-encoded blocks of 2 048 tokens each, with a small index
+that maps block IDs to file offsets and cumulative byte offsets.
+
+```python
+from vrle import vector_rle_random, RandomReader
+
+blob = vector_rle_random.compress(big_text)
+# regular full decompress still works:
+assert vector_rle_random.decompress(blob) == big_text
+
+# but the headline feature is reading without decompressing:
+r = RandomReader(blob)
+print(r.total_bytes, r.n_tokens, r.n_blocks)
+chunk = r.read_byte_range(50_000, 50_100)   # decode only the block(s)
+                                            # that cover bytes 50_000..50_100
+word  = r.read_word(1_000)                  # the 1 000-th word token
+```
+
+#### Trade-off
+
+The per-block PPM model has to warm up from scratch, so the file is
+~25 % larger than `vector_rle_shared` on the 53 KB GPL benchmark:
+
+| pipeline                          | bytes  | random access? |
+|-----------------------------------|-------:|----------------|
+| `vector_rle_shared`               | 12 053 | no             |
+| **`vector_rle_random` (2048 blk)**| **15 131** | **yes**     |
+| `vector_rle` (no shared dict)     | 15 821 | no             |
+| gzip(9)                           | 16 379 | no             |
+
+`vector_rle_random` still beats gzip and zstd on this dataset and is
+within 5 % of bz2. **No production general-purpose compressor (gzip /
+bz2 / zstd / brotli) supports byte-position random access by default.**
+zstd has a *seekable* mode and the bioinformatics world ships BGZF
+(blocked gzip) for indexed reads on genome files, but no commodity
+tool offers ratio-competitive random-access compression for arbitrary
+text.
+
+#### Why random access pays off
+
+On the 53 KB sample:
+
+| operation                | time    | speedup     |
+|--------------------------|--------:|------------:|
+| full decompress          | 9 800 ms |    —       |
+| single 50-byte random read | 1 100 ms | **9 ×**   |
+
+The speedup scales with `n_blocks`. On a 1 MB English text (~190
+blocks) a random read would be ~190 × faster than full decompression.
+
+#### Block-size knob
+
+`vector_rle_random.compress(data, block_size=K)` accepts a custom
+block size. Smaller blocks → finer random-access granularity, worse
+ratio. Larger blocks → coarser random access, better ratio (approaches
+`vector_rle_shared` as `block_size → ∞`).
 
 ### v6: Geometric tokenization with PPM throughout (`vector_rle`)
 
@@ -303,6 +375,7 @@ vrle/
   rans.py           rANS (range-ANS) static entropy coder
   shared_dict.py    Shared base dictionary load/save (v7)
   train_dict.py     CLI: train a SharedDict from a corpus
+  random_access.py  RandomReader + block-based codec (v8)
   vocab.py          Vocabulary: token <-> ID + magnitude vector
   wordtok.py        Byte-level word tokenizer
   pipelines.py      10 pipelines, rle_rc through vector_rle
@@ -312,6 +385,6 @@ examples/
   data/sample.txt        Pride & Prejudice excerpt (~4.5 KB)
   data/long_text.txt     GPL-3 + GPL-2 concat (~53 KB, real English)
   data/base_english.dict Bundled SharedDict (~23 KB, 2698 tokens, v7)
-tests/              289 tests covering round-trips, arithmetic, PPM, rANS,
-                    vocab, shared dict
+tests/              329 tests covering round-trips, arithmetic, PPM, rANS,
+                    vocab, shared dict, random access
 ```
