@@ -17,6 +17,8 @@ preserving positional order of the input.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 from .bitpack import BitReader, BitWriter, leb128_decode, leb128_encode
 from .bwt import bwt_decode, bwt_encode
@@ -39,6 +41,7 @@ from .ppm import (
     encode_ppm_seq,
     encode_ppm_stream,
 )
+from .shared_dict import SharedDict
 from .rangecoder import (
     decode_adaptive_stream as decode_stream,
     encode_adaptive_stream as encode_stream,
@@ -616,6 +619,119 @@ def _decompress_vector_rle(blob: bytes) -> bytes:
 vector_rle = Pipeline("vector_rle", _compress_vector_rle, _decompress_vector_rle)
 
 
+# ---------------------------------------------------------------------------
+# Pipeline K: vector_rle with a shared base dictionary
+# ---------------------------------------------------------------------------
+# Tokens already present in the shared base dict are referenced by their
+# base ID and their bytes are NOT shipped. Novel tokens (per-file delta)
+# go into the file's local extension dict with IDs starting at N_base.
+# Receivers may opportunistically absorb the delta into a local extended
+# dict; the file itself stays portable against the shared base.
+
+_BASE_DICT_CACHE: Optional[SharedDict] = None  # type: ignore[name-defined]
+
+
+def _shared_base_dict() -> SharedDict:
+    global _BASE_DICT_CACHE
+    if _BASE_DICT_CACHE is None:
+        path = Path(__file__).resolve().parent.parent / "examples" / "data" / "base_english.dict"
+        _BASE_DICT_CACHE = SharedDict.load(path)
+    return _BASE_DICT_CACHE
+
+
+def _compress_vector_rle_shared(data: bytes) -> bytes:
+    out = bytearray()
+    out += leb128_encode(len(data))
+    if not data:
+        return bytes(out)
+
+    base = _shared_base_dict()
+    n_base = len(base)
+
+    tokens = tokenize(data)
+
+    # Partition tokens: those in base vs novel. Novel tokens sorted
+    # alphabetically for canonical local-ID assignment (no frequency
+    # info written; PPM learns it).
+    seen_local: set = set()
+    novel_tokens: list = []
+    for t in tokens:
+        if base.get_id(t) is None and t not in seen_local:
+            seen_local.add(t)
+            novel_tokens.append(t)
+    novel_tokens.sort()
+
+    n_local = len(novel_tokens)
+    local_id_of: dict = {t: n_base + i for i, t in enumerate(novel_tokens)}
+
+    out += leb128_encode(base.version)
+    out += leb128_encode(n_local)
+    out += leb128_encode(len(tokens))
+
+    if n_local > 0:
+        lengths_bytes = bytes(len(t) for t in novel_tokens)
+        out += encode_ppm_stream(lengths_bytes, order=2)
+        out += encode_ppm_stream(b"".join(novel_tokens), order=4)
+
+    alphabet = n_base + n_local
+    if alphabet > 1:
+        ids = [
+            base.get_id(t) if base.get_id(t) is not None else local_id_of[t]
+            for t in tokens
+        ]
+        order = _vector_rle_ppm_order(len(ids))
+        out += encode_ppm_seq(ids, alphabet_size=alphabet, order=order)
+    return bytes(out)
+
+
+def _decompress_vector_rle_shared(blob: bytes) -> bytes:
+    pos = 0
+    input_len, pos = leb128_decode(blob, pos)
+    if input_len == 0:
+        return b""
+
+    base = _shared_base_dict()
+    n_base = len(base)
+
+    version, pos = leb128_decode(blob, pos)
+    if version != base.version:
+        raise ValueError(
+            f"shared dict version mismatch: file expects {version}, runtime has {base.version}"
+        )
+    n_local, pos = leb128_decode(blob, pos)
+    total, pos = leb128_decode(blob, pos)
+
+    novel_tokens: list = []
+    if n_local > 0:
+        lengths_bytes, pos = decode_ppm_stream(blob, pos)
+        bytes_blob, pos = decode_ppm_stream(blob, pos)
+        cursor = 0
+        for L in lengths_bytes:
+            novel_tokens.append(bytes_blob[cursor : cursor + L])
+            cursor += L
+
+    alphabet = n_base + n_local
+    if alphabet <= 1:
+        if total == 0:
+            return b""
+        tok = base.get_token(0) if n_local == 0 else novel_tokens[0]
+        return tok * total
+
+    ids, _ = decode_ppm_seq(blob, pos)
+    seq_tokens = [
+        base.get_token(i) if i < n_base else novel_tokens[i - n_base]
+        for i in ids
+    ]
+    return detokenize(seq_tokens)
+
+
+vector_rle_shared = Pipeline(
+    "vector_rle_shared",
+    _compress_vector_rle_shared,
+    _decompress_vector_rle_shared,
+)
+
+
 ALL_PIPELINES = [
     rle_rc,
     mtf_rle_rc,
@@ -627,4 +743,5 @@ ALL_PIPELINES = [
     ppm_rc,
     bwt_ppm_rc,
     vector_rle,
+    vector_rle_shared,
 ]

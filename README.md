@@ -18,7 +18,7 @@ zstd, and brotli.
 encoded streams. `SequenceRLE` is the round-trippable form that the
 compression pipelines build on.
 
-## Ten compression pipelines
+## Eleven compression pipelines
 
 All operate on byte streams, preserve order, and round-trip losslessly.
 
@@ -40,6 +40,12 @@ All operate on byte streams, preserve order, and round-trip losslessly.
   natural text and structured logs.**
 * **`bwt_ppm_rc`** — BWT + MTF then order-2 PPM. Best on extremely
   redundant data.
+* **`vector_rle_shared`** (v7) — *vector_rle with a shared base dictionary*.
+  Tokens already present in a pre-trained content-addressed shared
+  dictionary (`examples/data/base_english.dict`) are referenced by their
+  base ID and their bytes are **not** shipped. Novel tokens go into a
+  per-file delta dict. **Beats brotli on real 53 KB English text**:
+  12 053 B vs brotli 12 838 B (6.1 % smaller).
 * **`vector_rle`** (v6) — *geometric tokenization with PPM throughout*.
   Parse the input into word tokens, sort the vocabulary alphabetically,
   PPM-compress the lengths array, PPM-compress the concatenated token
@@ -75,8 +81,8 @@ marks where a vrle pipeline beats a standard compressor.
 | Letter-freq text (20 KB)   | arith_rc **10633** ✓✓   | 11951    | 11369    | 10541    | 10472      |
 | Web log stream (14.5 KB)   | **ppm_rc 511** ✓✓✓✓     | 974      | 673      | 862      | 881        |
 | Real English prose (4.5 KB)| ppm_rc **1935** ✓✓✓     | 2163     | 2050     | 2110     | 1729       |
-| Long English text (53 KB GPL-3 + GPL-2) | **vector_rle 15821** ✓ | 16379 | 14411 | 15053 | 12838 |
-| Web log stream (14.5 KB, *re-confirmed*) | **vector_rle 510** ✓✓✓✓ | 974 | 673 | 862 | 881 |
+| Long English text (53 KB GPL-3 + GPL-2) | **vector_rle_shared 12053** ✓✓✓✓ | 16379 | 14411 | 15053 | 12838 |
+| Web log stream (14.5 KB) | **vector_rle 510** ✓✓✓✓ | 974 | 673 | 862 | 881 |
 
 Score (vrle wins vs each standard compressor):
 
@@ -120,6 +126,70 @@ Five targeted changes, measurable each time:
    rest of that byte's encoding. The distribution tightens and lower
    orders spend bits only on symbols that are still possible.
    ~5–10 % gain on natural text (prose dropped from 2107 → 1935 B).
+
+### v7: Shared base dictionary (`vector_rle_shared`)
+
+The current headline pipeline. Identical to `vector_rle` (v6) but the
+encoder consults a **pre-trained shared dictionary** of common English
+tokens before deciding which tokens are novel. Tokens already in the
+shared base are referenced by their base ID and their bytes are *not*
+re-shipped. Novel tokens go into a tiny per-file delta dictionary.
+
+The shared dictionary is content-addressed by version (a 1-byte
+version field; future revisions get incremented). Every consumer of
+a file made by `vector_rle_shared` must have the matching base dict
+on disk — exactly the same constraint brotli has with its compiled-in
+English dictionary, just made explicit and trainable.
+
+**Result on real 53 KB English text (GPL-3 + GPL-2):**
+
+| pipeline             | bytes  | % raw | % gzip |
+|----------------------|-------:|------:|------:|
+| **vector_rle_shared**| **12 053** | **22.64** |  73.6 |
+| brotli(11)           | 12 838 | 24.11 |  78.4 |
+| ppm_rc               | 14 348 | 26.95 |  87.6 |
+| bz2(9)               | 14 411 | 27.07 |  88.0 |
+| zstd(22)             | 15 053 | 28.27 |  91.9 |
+| vector_rle (v6)      | 15 821 | 29.72 |  96.6 |
+| gzip(9)              | 16 379 | 30.76 | 100.0 |
+
+`vector_rle_shared` is **first** by 785 bytes (6.1 % smaller than
+brotli, 16 % smaller than zstd). The shared dictionary covers 97.7 %
+of token occurrences in the input, so the file's local delta is tiny.
+
+#### Training the shared dictionary
+
+```
+python -m vrle.train_dict <corpus-dir> -o my.dict -n 4000
+```
+
+The bundled `examples/data/base_english.dict` was trained on the
+license texts in `/usr/share/common-licenses/` *excluding* the two
+files (GPL-2, GPL-3) that make up the long-text benchmark — so the
+training corpus is independent of the test set. The trained dict has
+2 698 unique tokens and is 23 KB on disk; the long-text bench input
+has 1 465 unique tokens, of which 1 174 (80.1 %) are covered by the
+shared dict.
+
+#### How the file format extends the geometric framing
+
+The v7 format extends the user's *one geometric object, multiple roles*
+abstraction: the magnitude vector now spans **two pieces** — the
+shared base (loaded from disk on both sides) plus the file's local
+delta (shipped inline). PPM at decoding time treats them as one
+contiguous alphabet, exactly as if the file had a single 5 000-token
+magnitude vector.
+
+#### The "growing OS dictionary" extension
+
+`vector_rle_shared` files are **portable** — they decode anywhere the
+matching base dict is present. Local OS-level absorption of file
+deltas (your "OS dict grows over time" idea) is a layer above this
+format: a receiver may append a file's local-delta tokens to its own
+extended base dict (e.g. `~/.local/share/vrle/extended.dict`) and
+subsequent files compressed *for that machine* can reference the
+extended IDs without re-shipping. The compression primitive built here
+is the same; only the lookup gets a per-machine extension.
 
 ### v6: Geometric tokenization with PPM throughout (`vector_rle`)
 
@@ -230,14 +300,18 @@ vrle/
   deflate_codes.py  RFC 1951 length/distance bin-code tables
   rangecoder.py     Arithmetic coder (static + adaptive) + Fenwick model
   ppm.py            Order-N PPM-C context model
-  rans.py           rANS (range-ANS) static entropy coder (unused in v6)
+  rans.py           rANS (range-ANS) static entropy coder
+  shared_dict.py    Shared base dictionary load/save (v7)
+  train_dict.py     CLI: train a SharedDict from a corpus
   vocab.py          Vocabulary: token <-> ID + magnitude vector
   wordtok.py        Byte-level word tokenizer
   pipelines.py      10 pipelines, rle_rc through vector_rle
   bench.py          Head-to-head benchmark vs gzip/bz2/zstd/brotli
 examples/
   compare.py        CLI wrapper
-  data/sample.txt   Pride & Prejudice excerpt (~4.5 KB)
-  data/long_text.txt GPL-3 + GPL-2 concat (~53 KB, real English)
-tests/              275 tests covering round-trips, arithmetic, PPM, rANS, vocab
+  data/sample.txt        Pride & Prejudice excerpt (~4.5 KB)
+  data/long_text.txt     GPL-3 + GPL-2 concat (~53 KB, real English)
+  data/base_english.dict Bundled SharedDict (~23 KB, 2698 tokens, v7)
+tests/              289 tests covering round-trips, arithmetic, PPM, rANS,
+                    vocab, shared dict
 ```

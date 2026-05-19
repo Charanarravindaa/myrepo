@@ -14,8 +14,21 @@ from .pipelines import (
     ppm_rc,
     rle_rc,
     vector_rle,
+    vector_rle_shared,
 )
-from . import bitpack, bwt, deflate_codes, lz, mtf, ppm, rangecoder, rans, vocab, wordtok
+from . import (
+    bitpack,
+    bwt,
+    deflate_codes,
+    lz,
+    mtf,
+    ppm,
+    rangecoder,
+    rans,
+    shared_dict,
+    vocab,
+    wordtok,
+)
 
 __all__ = [
     "Run",
@@ -35,6 +48,7 @@ __all__ = [
     "ppm_rc",
     "bwt_ppm_rc",
     "vector_rle",
+    "vector_rle_shared",
     "ALL_PIPELINES",
     "bitpack",
     "bwt",
@@ -43,6 +57,7 @@ __all__ = [
     "ppm",
     "rangecoder",
     "rans",
+    "shared_dict",
     "vocab",
     "wordtok",
 ]
