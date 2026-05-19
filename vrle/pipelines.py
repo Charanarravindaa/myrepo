@@ -38,6 +38,9 @@ from .rangecoder import (
     decode_adaptive_stream as decode_stream,
     encode_adaptive_stream as encode_stream,
 )
+from .rans import rans_decode, rans_encode
+from .vocab import Vocabulary
+from .wordtok import detokenize, tokenize
 
 
 def _runs_to_streams(runs):
@@ -516,6 +519,91 @@ def _decompress_bwt_ppm_rc(blob: bytes) -> bytes:
 bwt_ppm_rc = Pipeline("bwt_ppm_rc", _compress_bwt_ppm_rc, _decompress_bwt_ppm_rc)
 
 
+# ---------------------------------------------------------------------------
+# Pipeline J: Geometric tokenization — word-level Vector-RLE + rANS
+# ---------------------------------------------------------------------------
+# The v5 unification. Tokenise the input into words; build a Vocabulary
+# whose magnitude vector serves *double duty* as both the dictionary
+# (token <-> id) and the entropy model that rANS uses to code the
+# positional index. One geometric object, two roles.
+
+
+def _compress_vector_rle(data: bytes) -> bytes:
+    """Geometric tokenization pipeline.
+
+    Compact serialization with the dictionary's concatenated bytes
+    PPM-compressed (the vocabulary itself has within-word byte-level
+    redundancy that the byte-level PPM coder catches). Layout:
+
+        leb128(input_len)
+        leb128(n_unique_tokens)
+        leb128(total_token_count)
+        for each unique token: leb128(len)         # length array
+        for each unique token: leb128(freq)        # magnitude vector
+        encode_ppm_stream(concatenated_token_bytes)
+        rans_encode(positional_ids, freqs)         # only if n_unique > 1
+    """
+    out = bytearray()
+    out += leb128_encode(len(data))
+    if not data:
+        return bytes(out)
+    tokens = tokenize(data)
+    vocab = Vocabulary.from_tokens(tokens)
+
+    n_unique = len(vocab)
+    out += leb128_encode(n_unique)
+    out += leb128_encode(vocab.total)
+    for tok in vocab.tokens:
+        out += leb128_encode(len(tok))
+    for f in vocab.freqs:
+        out += leb128_encode(f)
+    out += encode_ppm_stream(b"".join(vocab.tokens), order=4)
+
+    if n_unique > 1:
+        ids = vocab.tokens_to_ids(tokens)
+        out += rans_encode(ids, vocab.freqs)
+    return bytes(out)
+
+
+def _decompress_vector_rle(blob: bytes) -> bytes:
+    pos = 0
+    input_len, pos = leb128_decode(blob, pos)
+    if input_len == 0:
+        return b""
+    n_unique, pos = leb128_decode(blob, pos)
+    total, pos = leb128_decode(blob, pos)
+    lengths = []
+    for _ in range(n_unique):
+        L, pos = leb128_decode(blob, pos)
+        lengths.append(L)
+    freqs = []
+    for _ in range(n_unique):
+        f, pos = leb128_decode(blob, pos)
+        freqs.append(f)
+    bytes_blob, pos_after_bytes = decode_ppm_stream(blob, pos)
+    pos = pos_after_bytes
+    # Slice the concatenated token bytes back into individual tokens.
+    tokens_list = []
+    cursor = 0
+    for L in lengths:
+        tokens_list.append(bytes_blob[cursor : cursor + L])
+        cursor += L
+    vocab = Vocabulary(tokens_list, freqs)
+
+    if n_unique <= 1:
+        if total == 0:
+            seq_tokens = []
+        else:
+            seq_tokens = [vocab[0]] * total
+    else:
+        ids = rans_decode(blob[pos:], vocab.freqs, total)
+        seq_tokens = vocab.ids_to_tokens(ids)
+    return detokenize(seq_tokens)
+
+
+vector_rle = Pipeline("vector_rle", _compress_vector_rle, _decompress_vector_rle)
+
+
 ALL_PIPELINES = [
     rle_rc,
     mtf_rle_rc,
@@ -526,4 +614,5 @@ ALL_PIPELINES = [
     arith_rc,
     ppm_rc,
     bwt_ppm_rc,
+    vector_rle,
 ]

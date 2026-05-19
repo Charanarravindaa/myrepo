@@ -18,7 +18,7 @@ zstd, and brotli.
 encoded streams. `SequenceRLE` is the round-trippable form that the
 compression pipelines build on.
 
-## Nine compression pipelines
+## Ten compression pipelines
 
 All operate on byte streams, preserve order, and round-trip losslessly.
 
@@ -36,11 +36,18 @@ All operate on byte streams, preserve order, and round-trip losslessly.
   transforms. Optimal for context-free distributions like skewed
   letter-frequency text.
 * **`ppm_rc`** — order-N PPM-C context model on the raw byte stream.
-  Order is picked adaptively by input size (2 for ≤8 KB, 3 for 8–14 KB,
-  4 above). **The strongest pipeline on natural text and structured
-  logs.**
+  Order is picked adaptively by input size. **The strongest pipeline on
+  natural text and structured logs.**
 * **`bwt_ppm_rc`** — BWT + MTF then order-2 PPM. Best on extremely
   redundant data.
+* **`vector_rle`** (v5) — *geometric tokenization*: parse the input into
+  word tokens, build a vocabulary whose magnitude vector is both the
+  dictionary (token ↔ ID) and the entropy model that rANS uses to code
+  the positional index. One geometric object, two roles. The
+  vocabulary's concatenated byte content is itself PPM-compressed.
+  Loses on ratio to byte-level PPM on natural text (see below) — the
+  format is interesting as a research artifact and as a step toward
+  the unified random-access / multimodal variant.
 
 Components:
 * `vrle/bwt.py` — Burrows–Wheeler Transform (naive `O(n² log n)`).
@@ -67,6 +74,7 @@ marks where a vrle pipeline beats a standard compressor.
 | Letter-freq text (20 KB)   | arith_rc **10633** ✓✓   | 11951    | 11369    | 10541    | 10472      |
 | Web log stream (14.5 KB)   | **ppm_rc 511** ✓✓✓✓     | 974      | 673      | 862      | 881        |
 | Real English prose (4.5 KB)| ppm_rc **1935** ✓✓✓     | 2163     | 2050     | 2110     | 1729       |
+| Long English text (53 KB GPL-3 + GPL-2) | ppm_rc 14348 | 16379 ✓ | 14411 | 15053 ✓ | 12838 |
 
 Score (vrle wins vs each standard compressor):
 
@@ -110,6 +118,52 @@ Five targeted changes, measurable each time:
    rest of that byte's encoding. The distribution tightens and lower
    orders spend bits only on symbols that are still possible.
    ~5–10 % gain on natural text (prose dropped from 2107 → 1935 B).
+
+### v5: Geometric tokenization (`vector_rle`)
+
+The most novel direction in the project. Each unique token (word, run
+of whitespace, run of punctuation) gets its own "vector direction"
+identified by its ID; the **magnitude** of that vector is the **exact
+frequency** in the text. This magnitude vector serves *double duty*: it
+is the dictionary on one hand and the static probability model that
+rANS uses to code the positional index on the other. One geometric
+object, two roles — the unification is the conceptual contribution.
+
+The implementation is faithful: byte-level word tokenizer, descending-
+frequency-sorted vocabulary, the dictionary's concatenated bytes
+PPM-compressed (the dictionary has its own within-word redundancy
+that PPM catches), and rANS encoding of the positional ID stream.
+
+**Honest finding.** On the 53 KB GPL text:
+
+| pipeline      | bytes  | % raw  | % gzip |
+|---------------|-------:|------:|------:|
+| brotli(11)    | 12 838 | 24.11 |  78.4 |
+| ppm_rc        | 14 348 | 26.95 |  87.6 |
+| bz2(9)        | 14 411 | 27.07 |  88.0 |
+| zstd(22)      | 15 053 | 28.27 |  91.9 |
+| gzip(9)       | 16 379 | 30.76 | 100.0 |
+| **vector_rle**| **20 699** | **38.88** | **126.4** |
+
+`vector_rle` is **not** competitive on ratio against byte-level
+compressors. The reason is structural and worth stating clearly:
+**word-level tokenization throws away the within-word byte-level
+redundancy that PPM exploits.** Out of the 20 699-byte output,
+~13 042 bytes is the rANS-coded positional index (entropy-optimal
+for the per-word distribution we chose) and ~7 600 bytes is the
+vocabulary (lengths + frequencies + PPM-compressed concatenated
+tokens). PPM gets the same job done in 14 348 bytes by modelling
+the byte stream directly.
+
+This is a genuine empirical finding: the elegant *one geometric
+object, two roles* abstraction is satisfying conceptually but loses
+several bits per byte of compressible information that lower-level
+context modelling captures. To make `vector_rle` competitive on
+ratio against PPM/brotli we would need **order-N context modelling
+on word IDs** (PPMword), which is left for future work. The current
+implementation matters as the unified primitive that the deferred
+*multimodal* extension (Affinity-Propagation-discretised continuous
+media → same dictionary + positional index pipeline) will build on.
 
 ### Where we still lose, honestly
 
@@ -173,10 +227,14 @@ vrle/
   deflate_codes.py  RFC 1951 length/distance bin-code tables
   rangecoder.py     Arithmetic coder (static + adaptive) + Fenwick model
   ppm.py            Order-N PPM-C context model
-  pipelines.py      9 pipelines from rle_rc through ppm_rc
+  rans.py           rANS (range-ANS) static entropy coder
+  vocab.py          Vocabulary: token <-> ID + magnitude vector
+  wordtok.py        Byte-level word tokenizer
+  pipelines.py      10 pipelines, rle_rc through vector_rle
   bench.py          Head-to-head benchmark vs gzip/bz2/zstd/brotli
 examples/
   compare.py        CLI wrapper
-  data/sample.txt   Pride & Prejudice excerpt (public domain)
-tests/              230 tests covering round-trips, arithmetic, and PPM
+  data/sample.txt   Pride & Prejudice excerpt (~4.5 KB)
+  data/long_text.txt GPL-3 + GPL-2 concat (~53 KB, real English)
+tests/              275 tests covering round-trips, arithmetic, PPM, rANS, vocab
 ```

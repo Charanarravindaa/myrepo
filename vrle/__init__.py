@@ -13,8 +13,9 @@ from .pipelines import (
     mtf_rle_rc,
     ppm_rc,
     rle_rc,
+    vector_rle,
 )
-from . import bitpack, bwt, deflate_codes, lz, mtf, ppm, rangecoder
+from . import bitpack, bwt, deflate_codes, lz, mtf, ppm, rangecoder, rans, vocab, wordtok
 
 __all__ = [
     "Run",
@@ -33,6 +34,7 @@ __all__ = [
     "arith_rc",
     "ppm_rc",
     "bwt_ppm_rc",
+    "vector_rle",
     "ALL_PIPELINES",
     "bitpack",
     "bwt",
@@ -40,4 +42,7 @@ __all__ = [
     "mtf",
     "ppm",
     "rangecoder",
+    "rans",
+    "vocab",
+    "wordtok",
 ]

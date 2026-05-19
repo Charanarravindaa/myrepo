@@ -152,6 +152,13 @@ def _load_sample_text() -> bytes:
     return b""
 
 
+def _load_long_text() -> bytes:
+    p = Path(__file__).resolve().parent.parent / "examples" / "data" / "long_text.txt"
+    if p.is_file():
+        return p.read_bytes()
+    return b""
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -175,6 +182,11 @@ def main() -> None:
     real_text = _load_sample_text()
     if real_text:
         datasets.append(("Real English prose (Pride & Prejudice excerpt)", real_text))
+    long_text = _load_long_text()
+    if long_text:
+        datasets.append(
+            (f"Long English text (GPL-3 + GPL-2, {len(long_text)} B)", long_text)
+        )
 
     for name, data in datasets:
         sizes = _measure(name, data)
