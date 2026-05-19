@@ -919,25 +919,57 @@ def _dict_covers(data: bytes, dict_name: str, threshold: float = 0.75) -> bool:
     return (hits / len(toks)) >= threshold
 
 
+def _probe_best_tag(data: bytes, candidates: list, probe_size: int = 4096) -> int:
+    """Compress a probe-sized prefix with each candidate, return the tag
+    whose probe was smallest. Caller passes a list of (tag, encoder_fn)
+    pairs."""
+    probe = data[:probe_size]
+    best_tag, best_size = candidates[0][0], None
+    for tag, fn in candidates:
+        try:
+            sz = len(fn(probe))
+        except Exception:
+            continue
+        if best_size is None or sz < best_size:
+            best_size = sz
+            best_tag = tag
+    return best_tag
+
+
 def _compress_vector_auto(data: bytes) -> bytes:
     if not data:
         return bytes([_TAG_PPM_BYTE]) + leb128_encode(0)
     category = _classify(data)
-    tag = _category_to_tag(category)
 
-    # Dict-based tags get a coverage sanity check. If the chosen dict
-    # doesn't actually match the data, fall back to arith_rc (the
-    # right call for text-y inputs with no dict-matching word structure).
-    if tag in _DICT_NAMES_BY_TAG:
-        if not _dict_covers(data, _DICT_NAMES_BY_TAG[tag]):
-            tag = _TAG_ARITH
+    # Obvious fast paths.
+    if category == _CAT_RANDOM:
+        return bytes([_TAG_STORE_RAW]) + leb128_encode(len(data)) + data
+    if category == _CAT_REDUNDANT:
+        return bytes([_TAG_PPM_BYTE]) + encode_ppm_stream(data, order=4)
+    if category == _CAT_UNKNOWN:
+        return bytes([_TAG_PPM_BYTE]) + encode_ppm_stream(data, order=4)
+
+    # Text-y inputs: classifier suggests a dict, but on a misclassification
+    # the dict-based route can lose to byte-level PPM (e.g. Elizabethan
+    # English where the modern-dict coverage is too low to win). Probe a
+    # 4 KB prefix against the suggested-dict route AND byte-level PPM AND
+    # pure adaptive arithmetic, then pick whichever produces the smallest
+    # probe output and use that for the full encode.
+    suggested = _category_to_tag(category)
+    candidates = [
+        (_TAG_PPM_BYTE, lambda d: encode_ppm_stream(d, order=4)),
+        (_TAG_ARITH, _compress_arith_rc),
+    ]
+    if suggested in _DICT_NAMES_BY_TAG:
+        candidates.append(
+            (suggested, lambda d: _compress_with_dict_tag(d, suggested))
+        )
+    tag = _probe_best_tag(data, candidates)
 
     if tag == _TAG_PPM_BYTE:
         body = encode_ppm_stream(data, order=4)
     elif tag == _TAG_ARITH:
         body = _compress_arith_rc(data)
-    elif tag == _TAG_STORE_RAW:
-        body = leb128_encode(len(data)) + data
     else:
         body = _compress_with_dict_tag(data, tag)
     return bytes([tag]) + body
