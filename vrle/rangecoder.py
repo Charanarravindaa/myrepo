@@ -160,12 +160,11 @@ class ArithmeticEncoder:
             self._bits.append(1 - bit)
         self.pending = 0
 
-    def encode(self, table: FrequencyTable, sym: int) -> None:
-        lo, hi = table.cumul_range(sym)
+    def encode_freq(self, lo: int, hi: int, total: int) -> None:
+        """Low-level interval narrowing for an arbitrary cumulative range."""
         width = self.high - self.low + 1
-        self.high = self.low + width * hi // table.total - 1
-        self.low = self.low + width * lo // table.total
-        # Renormalise
+        self.high = self.low + width * hi // total - 1
+        self.low = self.low + width * lo // total
         while True:
             if self.high < HALF:
                 self._emit(0)
@@ -181,6 +180,10 @@ class ArithmeticEncoder:
                 break
             self.low = (self.low << 1) & MASK
             self.high = ((self.high << 1) | 1) & MASK
+
+    def encode(self, table: FrequencyTable, sym: int) -> None:
+        lo, hi = table.cumul_range(sym)
+        self.encode_freq(lo, hi, table.total)
 
     def finish(self) -> Tuple[bytes, int]:
         self.pending += 1
@@ -220,13 +223,16 @@ class ArithmeticDecoder:
         self.bit_pos += 1
         return bit
 
-    def decode(self, table: FrequencyTable) -> int:
+    def scale_value(self, total: int) -> int:
+        """Compute the scaled value the symbol falls within for `total`."""
         width = self.high - self.low + 1
-        scaled = ((self.value - self.low + 1) * table.total - 1) // width
-        sym = table.find(scaled)
-        lo, hi = table.cumul_range(sym)
-        self.high = self.low + width * hi // table.total - 1
-        self.low = self.low + width * lo // table.total
+        return ((self.value - self.low + 1) * total - 1) // width
+
+    def consume_freq(self, lo: int, hi: int, total: int) -> None:
+        """Low-level: narrow after the caller has determined the symbol."""
+        width = self.high - self.low + 1
+        self.high = self.low + width * hi // total - 1
+        self.low = self.low + width * lo // total
         while True:
             if self.high < HALF:
                 pass
@@ -243,6 +249,12 @@ class ArithmeticDecoder:
             self.low = (self.low << 1) & MASK
             self.high = ((self.high << 1) | 1) & MASK
             self.value = ((self.value << 1) | self._read_bit()) & MASK
+
+    def decode(self, table: FrequencyTable) -> int:
+        scaled = self.scale_value(table.total)
+        sym = table.find(scaled)
+        lo, hi = table.cumul_range(sym)
+        self.consume_freq(lo, hi, table.total)
         return sym
 
 
@@ -286,4 +298,136 @@ def decode_stream(buf: bytes, pos: int = 0) -> Tuple[List[int], int]:
     pos += payload_len
     dec = ArithmeticDecoder(payload, n_bits)
     out = [dec.decode(table) for _ in range(n_symbols)]
+    return out, pos
+
+
+# ---------------------------------------------------------------------------
+# Adaptive frequency model (Fenwick tree) and adaptive streams
+# ---------------------------------------------------------------------------
+
+
+class FenwickFreq:
+    """Adaptive cumulative-frequency model backed by a Fenwick (BIT) tree.
+
+    Supports O(log n) increment / prefix-sum / symbol-lookup. Used by the
+    adaptive arithmetic coder and (later) by per-context PPM models.
+    Counts must stay below MAX_TOTAL; ``halve`` rescales when they don't.
+    """
+
+    __slots__ = ("n", "tree", "total")
+
+    def __init__(self, alphabet_size: int) -> None:
+        if alphabet_size <= 0:
+            raise ValueError("alphabet_size must be positive")
+        self.n = alphabet_size
+        self.tree = [0] * (alphabet_size + 1)
+        self.total = 0
+
+    def increment(self, sym: int, delta: int = 1) -> None:
+        self.total += delta
+        i = sym + 1
+        while i <= self.n:
+            self.tree[i] += delta
+            i += i & -i
+
+    def prefix_sum(self, k: int) -> int:
+        """Sum of counts of symbols 0..k-1 (i.e. ``cumul[k]``)."""
+        s = 0
+        i = k
+        while i > 0:
+            s += self.tree[i]
+            i -= i & -i
+        return s
+
+    def count_at(self, sym: int) -> int:
+        return self.prefix_sum(sym + 1) - self.prefix_sum(sym)
+
+    def find_sym(self, target: int) -> int:
+        """Largest ``sym`` such that ``prefix_sum(sym) <= target``."""
+        pos = 0
+        bit = 1
+        while bit * 2 <= self.n:
+            bit *= 2
+        while bit > 0:
+            nxt = pos + bit
+            if nxt <= self.n and self.tree[nxt] <= target:
+                pos = nxt
+                target -= self.tree[pos]
+            bit >>= 1
+        return pos
+
+    def halve(self) -> None:
+        """Halve every count (preserving a minimum of 1 for non-zero ones)."""
+        counts = [self.count_at(i) for i in range(self.n)]
+        self.tree = [0] * (self.n + 1)
+        self.total = 0
+        for i, c in enumerate(counts):
+            if c > 0:
+                self.increment(i, max(1, c // 2))
+
+
+def encode_adaptive_stream(symbols: List[int], alphabet_size: int) -> bytes:
+    """Adaptive arithmetic-coded stream — no static model header.
+
+    Frequency model starts uniform (every symbol seeded at count 1) and
+    is updated after each symbol is encoded. When the running total
+    reaches MAX_TOTAL, all counts are halved. Decoder mirrors the same
+    update schedule. Self-delimiting layout:
+
+        leb128(n_symbols)
+        [ leb128(alphabet_size)
+          leb128(n_bits) leb128(payload_len) payload ]   # only if n_symbols > 0
+    """
+    out = bytearray()
+    out += leb128_encode(len(symbols))
+    if not symbols:
+        return bytes(out)
+    out += leb128_encode(alphabet_size)
+
+    freq = FenwickFreq(alphabet_size)
+    for i in range(alphabet_size):
+        freq.increment(i, 1)
+
+    enc = ArithmeticEncoder()
+    for s in symbols:
+        lo = freq.prefix_sum(s)
+        hi = lo + freq.count_at(s)
+        enc.encode_freq(lo, hi, freq.total)
+        freq.increment(s, 1)
+        if freq.total >= MAX_TOTAL:
+            freq.halve()
+
+    payload, n_bits = enc.finish()
+    out += leb128_encode(n_bits)
+    out += leb128_encode(len(payload))
+    out += payload
+    return bytes(out)
+
+
+def decode_adaptive_stream(buf: bytes, pos: int = 0) -> Tuple[List[int], int]:
+    n_symbols, pos = leb128_decode(buf, pos)
+    if n_symbols == 0:
+        return [], pos
+    alphabet_size, pos = leb128_decode(buf, pos)
+    n_bits, pos = leb128_decode(buf, pos)
+    payload_len, pos = leb128_decode(buf, pos)
+    payload = buf[pos : pos + payload_len]
+    pos += payload_len
+
+    freq = FenwickFreq(alphabet_size)
+    for i in range(alphabet_size):
+        freq.increment(i, 1)
+
+    dec = ArithmeticDecoder(payload, n_bits)
+    out: List[int] = []
+    for _ in range(n_symbols):
+        scaled = dec.scale_value(freq.total)
+        s = freq.find_sym(scaled)
+        lo = freq.prefix_sum(s)
+        hi = lo + freq.count_at(s)
+        dec.consume_freq(lo, hi, freq.total)
+        out.append(s)
+        freq.increment(s, 1)
+        if freq.total >= MAX_TOTAL:
+            freq.halve()
     return out, pos

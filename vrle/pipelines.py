@@ -33,7 +33,10 @@ from .deflate_codes import (
 )
 from .lz import lz77_decode, lz77_encode
 from .mtf import mtf_decode, mtf_encode
-from .rangecoder import decode_stream, encode_stream
+from .rangecoder import (
+    decode_adaptive_stream as decode_stream,
+    encode_adaptive_stream as encode_stream,
+)
 
 
 def _runs_to_streams(runs):
