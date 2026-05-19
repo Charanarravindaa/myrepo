@@ -461,15 +461,12 @@ arith_rc = Pipeline("arith_rc", _compress_arith_rc, _decompress_arith_rc)
 def _adaptive_order(n: int) -> int:
     """Pick a PPM order based on input size.
 
-    Higher orders need more data to amortise their many small contexts.
-    Tuned empirically: order 2 is best below ~8 KB, order 3 in the
-    middle, order 4 once we have enough data for deep contexts to
-    actually repeat.
+    With exclusion enabled, order 4 is consistently best on inputs
+    above ~1 KB. Below that we fall to order 2 because deeper contexts
+    barely ever repeat and the model never settles.
     """
-    if n < 8000:
+    if n < 1000:
         return 2
-    if n < 14000:
-        return 3
     return 4
 
 

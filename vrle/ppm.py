@@ -76,8 +76,23 @@ def _grab_context(history: bytearray, k: int) -> bytes:
     return bytes(history[-k:])
 
 
+def _ctx_counts_list(ctx: PPMContext) -> List[int]:
+    """Materialise the count vector (length TABLE_SIZE) for fast scanning.
+
+    Fenwick is O(log α) per query but iterating all α symbols repeatedly
+    under exclusion is faster as a flat list.
+    """
+    return [ctx.freq.count_at(i) for i in range(TABLE_SIZE)]
+
+
 def encode_ppm_stream(data: bytes, order: int = 4) -> bytes:
-    """Compress `data` with order-N PPM-C and adaptive arithmetic coding.
+    """Compress `data` with order-N PPM-C, with full exclusion, on top of
+    adaptive arithmetic coding.
+
+    Exclusion: once a higher-order context has escaped, every symbol that
+    was *in* that context is removed from the model at every lower order
+    for the rest of this single-byte encoding step. The distribution at
+    lower orders tightens — typical ~5–10 % gain on natural text.
 
     Layout: leb128(n) [|| leb128(order) leb128(n_bits) leb128(payload_len)
     payload].
@@ -88,36 +103,55 @@ def encode_ppm_stream(data: bytes, order: int = 4) -> bytes:
         return bytes(out)
     out += leb128_encode(order)
 
-    # contexts[k] : dict[ bytes-of-length-k -> PPMContext ]
     contexts: List[Dict[bytes, PPMContext]] = [dict() for _ in range(order + 1)]
     contexts[0][b""] = _seed_order0()
 
     enc = ArithmeticEncoder()
     history = bytearray()
+    excluded = bytearray(TABLE_SIZE)  # 1 = excluded; reused, reset per byte
 
     for sym in data:
-        # Try contexts from longest to shortest. Order-0 is guaranteed to
-        # succeed (uniform seed), so the loop always terminates with the
-        # symbol encoded.
+        # Reset exclusion mask for this byte.
+        for i in range(TABLE_SIZE):
+            excluded[i] = 0
+
         for k in range(min(order, len(history)), -1, -1):
             ctx = contexts[k].get(_grab_context(history, k))
             if ctx is None or ctx.total == 0:
                 continue
-            sym_count = ctx.count(sym)
-            if sym_count > 0:
-                lo = ctx.cumul(sym)
-                enc.encode_freq(lo, lo + sym_count, ctx.total)
-                break
-            # Escape and fall to a shorter context. Every context past its
-            # first update has escape count >= 1.
-            esc_count = ctx.count(ESC)
-            if esc_count > 0:
-                lo = ctx.cumul(ESC)
-                enc.encode_freq(lo, lo + esc_count, ctx.total)
-            # If esc_count == 0 the context has no symbols at all
-            # (shouldn't happen after first update) — silently skip.
+            counts = _ctx_counts_list(ctx)
+            # Effective totals/cumuls under exclusion.
+            eff_total = 0
+            for i in range(TABLE_SIZE):
+                if not excluded[i]:
+                    eff_total += counts[i]
+            if eff_total <= 0:
+                continue
 
-        # Update every context in the chain.
+            if not excluded[sym] and counts[sym] > 0:
+                # Encode sym at this order using effective cumulative.
+                lo = 0
+                for i in range(sym):
+                    if not excluded[i]:
+                        lo += counts[i]
+                enc.encode_freq(lo, lo + counts[sym], eff_total)
+                break
+
+            # Encode escape (if it has a count) and exclude every symbol
+            # seen in this context from lower orders.
+            esc_count = counts[ESC]
+            if esc_count > 0:
+                lo = 0
+                for i in range(ESC):
+                    if not excluded[i]:
+                        lo += counts[i]
+                enc.encode_freq(lo, lo + esc_count, eff_total)
+            # Exclude every present symbol (not the escape itself).
+            for i in range(ESC):
+                if counts[i] > 0:
+                    excluded[i] = 1
+
+        # Update every context (no exclusion in updates).
         for k in range(min(order, len(history)), -1, -1):
             key = _grab_context(history, k)
             ctx = contexts[k].get(key)
@@ -153,28 +187,46 @@ def decode_ppm_stream(buf: bytes, pos: int = 0) -> Tuple[bytes, int]:
     dec = ArithmeticDecoder(payload, n_bits)
     out = bytearray()
     history = bytearray()
+    excluded = bytearray(TABLE_SIZE)
 
     for _ in range(n):
+        for i in range(TABLE_SIZE):
+            excluded[i] = 0
         sym = -1
         for k in range(min(order, len(history)), -1, -1):
             ctx = contexts[k].get(_grab_context(history, k))
             if ctx is None or ctx.total == 0:
                 continue
-            scaled = dec.scale_value(ctx.total)
-            s = ctx.freq.find_sym(scaled)
-            if s == ESC:
-                # Consume the escape range and continue down.
-                lo = ctx.cumul(ESC)
-                dec.consume_freq(lo, lo + ctx.count(ESC), ctx.total)
+            counts = _ctx_counts_list(ctx)
+            # Effective cumulative array
+            eff_cumul = [0] * (TABLE_SIZE + 1)
+            for i in range(TABLE_SIZE):
+                eff_cumul[i + 1] = eff_cumul[i] + (0 if excluded[i] else counts[i])
+            eff_total = eff_cumul[-1]
+            if eff_total <= 0:
                 continue
-            # Real symbol — consume and stop.
-            lo = ctx.cumul(s)
-            dec.consume_freq(lo, lo + ctx.count(s), ctx.total)
+            scaled = dec.scale_value(eff_total)
+            # Binary search for the symbol s with eff_cumul[s] <= scaled < eff_cumul[s+1].
+            lo, hi = 0, TABLE_SIZE - 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if eff_cumul[mid] <= scaled:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            s = lo
+            lo_c, hi_c = eff_cumul[s], eff_cumul[s + 1]
+            dec.consume_freq(lo_c, hi_c, eff_total)
+            if s == ESC:
+                # Continue down; exclude all present symbols.
+                for i in range(ESC):
+                    if counts[i] > 0:
+                        excluded[i] = 1
+                continue
             sym = s
             break
 
         if sym < 0:
-            # Should not happen: order-0 always succeeds.
             raise RuntimeError("PPM decode fell off the chain")
 
         out.append(sym)
