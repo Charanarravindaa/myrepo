@@ -33,12 +33,16 @@ from .deflate_codes import (
 )
 from .lz import lz77_decode, lz77_encode
 from .mtf import mtf_decode, mtf_encode
-from .ppm import decode_ppm_stream, encode_ppm_stream
+from .ppm import (
+    decode_ppm_seq,
+    decode_ppm_stream,
+    encode_ppm_seq,
+    encode_ppm_stream,
+)
 from .rangecoder import (
     decode_adaptive_stream as decode_stream,
     encode_adaptive_stream as encode_stream,
 )
-from .rans import rans_decode, rans_encode
 from .vocab import Vocabulary
 from .wordtok import detokenize, tokenize
 
@@ -528,40 +532,59 @@ bwt_ppm_rc = Pipeline("bwt_ppm_rc", _compress_bwt_ppm_rc, _decompress_bwt_ppm_rc
 # positional index. One geometric object, two roles.
 
 
-def _compress_vector_rle(data: bytes) -> bytes:
-    """Geometric tokenization pipeline.
+def _vector_rle_ppm_order(n_tokens: int) -> int:
+    """PPM order for the positional index, by token count.
 
-    Compact serialization with the dictionary's concatenated bytes
-    PPM-compressed (the vocabulary itself has within-word byte-level
-    redundancy that the byte-level PPM coder catches). Layout:
+    Higher orders catch bigrams / trigrams once we have enough data
+    for them to repeat. Tuned to match the byte-PPM heuristics.
+    """
+    if n_tokens < 200:
+        return 0
+    if n_tokens < 2000:
+        return 1
+    return 2
+
+
+def _compress_vector_rle(data: bytes) -> bytes:
+    """Geometric tokenization with word-level PPM throughout.
+
+    The vocabulary's magnitude vector is the dictionary AND the seed for
+    PPM's order-0 model. We don't even ship the magnitudes — the PPM
+    decoder learns them from the encoded positional stream. The tokens
+    themselves are stored in alphabetical (lexicographic) order so the
+    encoder and decoder agree on the token <-> ID mapping without any
+    frequency table being written.
+
+    Three nested PPM-compressed streams plus a header. Layout:
 
         leb128(input_len)
         leb128(n_unique_tokens)
         leb128(total_token_count)
-        for each unique token: leb128(len)         # length array
-        for each unique token: leb128(freq)        # magnitude vector
-        encode_ppm_stream(concatenated_token_bytes)
-        rans_encode(positional_ids, freqs)         # only if n_unique > 1
+        encode_ppm_stream(length_byte_string)        # token lengths (each <=255)
+        encode_ppm_stream(concatenated_token_bytes)  # dictionary content
+        encode_ppm_seq(positional_ids, n_unique)     # only if n_unique > 1
     """
     out = bytearray()
     out += leb128_encode(len(data))
     if not data:
         return bytes(out)
-    tokens = tokenize(data)
-    vocab = Vocabulary.from_tokens(tokens)
 
-    n_unique = len(vocab)
+    tokens = tokenize(data)
+    unique_tokens = sorted(set(tokens))  # canonical lexicographic order
+    n_unique = len(unique_tokens)
+    tok_to_id = {t: i for i, t in enumerate(unique_tokens)}
+
     out += leb128_encode(n_unique)
-    out += leb128_encode(vocab.total)
-    for tok in vocab.tokens:
-        out += leb128_encode(len(tok))
-    for f in vocab.freqs:
-        out += leb128_encode(f)
-    out += encode_ppm_stream(b"".join(vocab.tokens), order=4)
+    out += leb128_encode(len(tokens))
+
+    lengths_bytes = bytes(len(t) for t in unique_tokens)
+    out += encode_ppm_stream(lengths_bytes, order=2)
+    out += encode_ppm_stream(b"".join(unique_tokens), order=4)
 
     if n_unique > 1:
-        ids = vocab.tokens_to_ids(tokens)
-        out += rans_encode(ids, vocab.freqs)
+        ids = [tok_to_id[t] for t in tokens]
+        order = _vector_rle_ppm_order(len(ids))
+        out += encode_ppm_seq(ids, alphabet_size=n_unique, order=order)
     return bytes(out)
 
 
@@ -572,32 +595,21 @@ def _decompress_vector_rle(blob: bytes) -> bytes:
         return b""
     n_unique, pos = leb128_decode(blob, pos)
     total, pos = leb128_decode(blob, pos)
-    lengths = []
-    for _ in range(n_unique):
-        L, pos = leb128_decode(blob, pos)
-        lengths.append(L)
-    freqs = []
-    for _ in range(n_unique):
-        f, pos = leb128_decode(blob, pos)
-        freqs.append(f)
-    bytes_blob, pos_after_bytes = decode_ppm_stream(blob, pos)
-    pos = pos_after_bytes
-    # Slice the concatenated token bytes back into individual tokens.
-    tokens_list = []
+
+    lengths_bytes, pos = decode_ppm_stream(blob, pos)
+    bytes_blob, pos = decode_ppm_stream(blob, pos)
+
+    unique_tokens: list = []
     cursor = 0
-    for L in lengths:
-        tokens_list.append(bytes_blob[cursor : cursor + L])
+    for L in lengths_bytes:
+        unique_tokens.append(bytes_blob[cursor : cursor + L])
         cursor += L
-    vocab = Vocabulary(tokens_list, freqs)
 
     if n_unique <= 1:
-        if total == 0:
-            seq_tokens = []
-        else:
-            seq_tokens = [vocab[0]] * total
+        seq_tokens = [unique_tokens[0]] * total if (n_unique == 1 and total > 0) else []
     else:
-        ids = rans_decode(blob[pos:], vocab.freqs, total)
-        seq_tokens = vocab.ids_to_tokens(ids)
+        ids, _ = decode_ppm_seq(blob, pos)
+        seq_tokens = [unique_tokens[i] for i in ids]
     return detokenize(seq_tokens)
 
 

@@ -34,19 +34,32 @@ def _is_word_byte(b: int) -> bool:
     return False
 
 
+MAX_TOKEN_LEN = 255  # so length fits in a single byte
+
+
 def tokenize(data: bytes) -> List[bytes]:
     if not data:
         return []
     tokens: List[bytes] = []
     start = 0
     cur_class = _is_word_byte(data[0])
+
+    def _emit(s: int, e: int) -> None:
+        # Split very long maximal runs at the byte-length cap so every
+        # token's length fits in a single byte (used by vector_rle).
+        while e - s > MAX_TOKEN_LEN:
+            tokens.append(bytes(data[s : s + MAX_TOKEN_LEN]))
+            s += MAX_TOKEN_LEN
+        if e > s:
+            tokens.append(bytes(data[s:e]))
+
     for i in range(1, len(data)):
         cls = _is_word_byte(data[i])
         if cls != cur_class:
-            tokens.append(bytes(data[start:i]))
+            _emit(start, i)
             start = i
             cur_class = cls
-    tokens.append(bytes(data[start:]))
+    _emit(start, len(data))
     return tokens
 
 
